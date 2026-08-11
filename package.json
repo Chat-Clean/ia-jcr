@@ -1,0 +1,35 @@
+{
+  "name": "iaavellozcg",
+  "version": "1.0.0",
+  "description": "IA de Atendimento Avelloz Campina — IA externa de captação e qualificação de leads (Webhook + Push API ChatClean)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "chat": "node test-chat.js",
+    "sim": "node sim-lead.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "webhook",
+    "chatclean",
+    "avelloz",
+    "ia",
+    "sdr",
+    "motos",
+    "openai"
+  ],
+  "author": "ChatClean",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.22.1",
+    "form-data": "^4.0.5",
+    "ioredis": "^5.11.1",
+    "openai": "^4.104.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

@@ -1,0 +1,1040 @@
+require('dotenv').config();
+const express = require('express');
+const OpenAI = require('openai');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const FormData = require('form-data');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+
+// =============================================================
+//  CONFIGURAÇÃO — ChatClean (Webhook de entrada + Push API de saída)
+//  Variáveis no .env (ver .env.example):
+//
+//  CC_PUSH_URL     = URL autenticada gerada em Configurações → API/Webhook → Adicionar
+//                    (o token JWT já vem embutido como ?token=...; sem header)
+//  WEBHOOK_SECRET  = Token opcional para validar o webhook de entrada
+//                    (o ChatClean hoje NÃO envia token no header → deixe vazio)
+//  EQUIPE_NUMERO   = WhatsApp interno que recebe o resumo dos leads qualificados
+//  IA_ALLOWED_CONTACTS = Números liberados na fase de teste (vazio = responde a todos)
+//  PORT            = Porta do servidor (padrão: 3000)
+// =============================================================
+const CC_PUSH_URL    = process.env.CC_PUSH_URL    || '';
+const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || '';
+const EQUIPE_NUMERO  = process.env.EQUIPE_NUMERO  || '';
+const IA_ALLOWED_CONTACTS = (process.env.IA_ALLOWED_CONTACTS || '').split(',').map(s => s.trim()).filter(Boolean);
+const PORT           = process.env.PORT           || 3000;
+// Chave para proteger os endpoints administrativos (/leads, /diag), que expõem
+// dados de leads e config. Sem ela, esses endpoints ficam BLOQUEADOS (não abertos).
+const ADMIN_KEY      = process.env.ADMIN_KEY      || '';
+// A IA NÃO responde em grupos por padrão (só conversa individual). Para permitir
+// grupos no futuro, defina IGNORAR_GRUPOS=false.
+const IGNORAR_GRUPOS = (process.env.IGNORAR_GRUPOS || 'true') !== 'false';
+// A IA só responde tickets PENDENTES (na fila). Quando um humano aceita a
+// conversa (ticket sai de "pending"), a IA para de responder. Para desativar
+// esse filtro, defina IA_SO_PENDENTES=false.
+const IA_SO_PENDENTES = (process.env.IA_SO_PENDENTES || 'true') !== 'false';
+// Rate-limit por número: no máximo RATE_LIMIT_MSGS mensagens por janela de
+// RATE_LIMIT_JANELA_S segundos (proteção contra loop/spam e custo OpenAI).
+// 0 desativa. Padrão: 20 msgs / 60s.
+const RATE_LIMIT_MSGS   = parseInt(process.env.RATE_LIMIT_MSGS   || '20', 10);
+const RATE_LIMIT_JANELA = parseInt(process.env.RATE_LIMIT_JANELA_S || '60', 10) * 1000;
+// Blindagem anti-loop (contra outras IAs / auto-respondedores): se um mesmo
+// contato trocar mais de LOOP_MAX_TURNOS mensagens em LOOP_JANELA_MIN minutos,
+// ou repetir a mesma mensagem, a IA PAUSA as respostas para não entrar em
+// ping-pong infinito com outro bot.
+const LOOP_MAX_TURNOS = parseInt(process.env.LOOP_MAX_TURNOS || '15', 10);
+const LOOP_JANELA_MS  = parseInt(process.env.LOOP_JANELA_MIN || '3', 10) * 60 * 1000;
+// Janela (ms) para AGRUPAR mensagens rápidas do mesmo cliente antes de responder.
+// No WhatsApp o cliente costuma mandar várias mensagens seguidas; juntamos tudo
+// num único turno em vez de responder só a primeira e ignorar o resto.
+const AGRUPAR_MS     = parseInt(process.env.AGRUPAR_MENSAGENS_MS || '2000', 10);
+// Reinicia o atendimento após N horas sem interação do cliente (padrão: 24h).
+const RESET_INATIVIDADE = parseInt(process.env.RESET_INATIVIDADE_HORAS || '24', 10) * 3600 * 1000;
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, lojaParaDepartamento } = require('./data');
+const { SYSTEM_SDR, promptExtracao, promptResposta } = require('./prompts');
+const { determinarProximoCampo, aplicarCampos, detectarPerfil } = require('./flow');
+
+// Departamento de transbordo do lead = a loja que ele escolheu (obrigatória
+// no fluxo). Sem loja identificada, cai no Comercial geral.
+function departamentoLead(leadData) {
+    return lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.geral;
+}
+const { estaEmExpediente } = require('./horario');
+const pipeline = require('./pipeline'); // Oportunidades no CRM (inerte se não configurado)
+const store = require('./store'); // estado das conversas (Redis + fallback em memória)
+
+const processandoMensagem = new Map(); // lock de processamento (por instância)
+
+// =============================================================
+//  UTILITÁRIOS
+// =============================================================
+function normalizarPhone(phone) {
+    // Corta sufixos de JID antes de limpar: "558491756446:24@s.whatsapp.net"
+    // tem o ID do dispositivo (:24) e o servidor (@...). Sem cortar, o :24
+    // grudaria no número (…6446 + 24). Pega só a parte antes de ':' e '@'.
+    return String(phone).split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+// Núcleo canônico de um número BR p/ COMPARAÇÃO (ignora o 9º dígito de celular).
+// Ex.: 5584994610845 (13) e 558494610845 (12) viram o mesmo núcleo → casam.
+function nucleoNumero(n) {
+    let d = String(n).split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (d.length === 13 && d.startsWith('55') && d[4] === '9') {
+        d = d.slice(0, 4) + d.slice(5); // remove o 9 logo após o DDD
+    }
+    return d;
+}
+
+// true se o número está na allow-list (tolerante ao 9º dígito). Lista vazia = libera todos.
+function contatoPermitido(numero) {
+    if (!IA_ALLOWED_CONTACTS.length) return true;
+    const alvo = nucleoNumero(numero);
+    return IA_ALLOWED_CONTACTS.some(a => nucleoNumero(a) === alvo);
+}
+
+// =============================================================
+//  CHATCLEAN — ENVIO VIA PUSH API
+//  Um único endpoint autenticado (CC_PUSH_URL) entrega as mensagens.
+//  O token JWT já vem embutido na URL como ?token=... (sem header).
+// =============================================================
+async function ccPush(number, payloadExtra = {}) {
+    if (!CC_PUSH_URL) { console.warn('⚠️ CC_PUSH_URL não configurado no .env — envio ignorado'); return false; }
+    try {
+        await axios.post(CC_PUSH_URL, {
+            number: normalizarPhone(number),
+            externalKey: crypto.randomUUID(),
+            ...payloadExtra
+        }, { headers: { 'Content-Type': 'application/json' }, timeout: 30000 });
+        return true;
+    } catch (e) {
+        console.error('❌ Erro no Push ChatClean:', e.response?.data || e.message);
+        return false;
+    }
+}
+
+async function enviarMensagem(chatId, texto) {
+    if (!texto || !String(texto).trim()) return false;
+    return ccPush(chatId, { body: texto });
+}
+
+// Quebra a resposta em mensagens curtas (registro de WhatsApp), a menos que
+// seja um resumo/encaminhamento (mandado inteiro).
+async function enviarMensagensQuebradas(chatId, textoCompleto) {
+    if (/encaminhando|consultor|especialista|resumo|repassando/i.test(textoCompleto)) {
+        await enviarMensagem(chatId, textoCompleto);
+        return;
+    }
+    const partes = String(textoCompleto).split('\n').filter(p => p.trim());
+    for (const parte of partes) {
+        await new Promise(r => setTimeout(r, 900 + parte.length * 18));
+        await enviarMensagem(chatId, parte);
+    }
+}
+
+// Notifica a equipe (nota interna no ticket + WhatsApp interno) quando um lead
+// é qualificado, e sinaliza a transferência de departamento no CRM.
+// Monta o resumo estruturado do lead (reusado na nota da equipe e na descrição do evento).
+function montarResumo(leadData, chatId, opcoes = {}) {
+    const departamento = opcoes.departamento || departamentoLead(leadData);
+    const perfilNome = leadData.perfilKey && PERFIS[leadData.perfilKey]
+        ? PERFIS[leadData.perfilKey].nome : 'Não informado';
+    const temDadosSim = leadData.nomeCompleto || leadData.cpf || leadData.dataNascimento || leadData.telefone || leadData.cnh || leadData.corModelo;
+    return `🏍️ LEAD QUALIFICADO — Avelloz Campina${opcoes.tagExtra ? ' [' + opcoes.tagExtra + ']' : ''}\n\n` +
+        `Contato: ${leadData.nome || 'Lead'} (${chatId})\n` +
+        `Perfil: ${perfilNome}\n` +
+        `Finalidade: ${leadData.finalidade || 'Não informado'}\n` +
+        `Transporte hoje: ${leadData.transporteAtual || 'Não informado'}\n` +
+        `Gasto atual: ${leadData.gastoMensal || 'Não informado'}\n` +
+        `Situação de moto: ${leadData.situacaoMoto || 'Não informado'}\n` +
+        `Modelo de interesse: ${leadData.modeloInteresse || 'Não informado'}\n` +
+        `Forma de pagamento: ${leadData.formaPagamento || 'Não informado'}\n` +
+        `Loja escolhida: ${leadData.loja || 'Não informada'}\n` +
+        (temDadosSim
+            ? `\nDados p/ simulação:\n` +
+              `  Nome completo: ${leadData.nomeCompleto || 'Não informado'}\n` +
+              `  CPF: ${leadData.cpf || 'Não informado'}\n` +
+              `  Nascimento: ${leadData.dataNascimento || 'Não informado'}\n` +
+              `  Telefone: ${leadData.telefone || 'Não informado'}\n` +
+              `  CNH: ${leadData.cnh || 'Não informado'}\n` +
+              `  Cor/modelo: ${leadData.corModelo || 'Não informado'}\n`
+            : '') +
+        (opcoes.proximoExpediente ? `Retorno sugerido: ${opcoes.proximoExpediente}\n` : '') +
+        `\n➡️ Transferir para o departamento ${departamento}`;
+}
+
+async function notificarEquipe(leadData, chatId, opcoes = {}) {
+    const departamento = opcoes.departamento || departamentoLead(leadData);
+    const perfilNome = leadData.perfilKey && PERFIS[leadData.perfilKey]
+        ? PERFIS[leadData.perfilKey].nome : 'Não informado';
+    const resumo = montarResumo(leadData, chatId, opcoes);
+
+    // Nota interna no ticket do próprio cliente (fica no CRM p/ o atendente)
+    await ccPush(chatId, { body: resumo, onlyNote: true, note: { body: resumo } });
+    // Resumo também por WhatsApp interno, se houver número da equipe
+    if (EQUIPE_NUMERO) await ccPush(EQUIPE_NUMERO, { body: resumo });
+
+    // Histórico append-only de leads qualificados
+    try {
+        await store.appendLeadFinalizado({
+            chatId, nome: leadData.nome || null, perfil: perfilNome,
+            finalidade: leadData.finalidade || null, transporteAtual: leadData.transporteAtual || null,
+            gastoMensal: leadData.gastoMensal || null, modeloInteresse: leadData.modeloInteresse || null,
+            formaPagamento: leadData.formaPagamento || null, loja: leadData.loja || null,
+            departamento, data: new Date().toISOString()
+        });
+    } catch (e) { console.error('❌ appendLeadFinalizado:', e.message); }
+
+    console.log(`✅ Equipe notificada — lead ${leadData.nome || ''} (${chatId}) → ${departamento}`);
+    return true;
+}
+
+// A state machine (determinarProximoCampo / aplicarCampos / detectarPerfil)
+// vive em ./flow para ser reusada pelo tester local sem duplicar lógica.
+
+// =============================================================
+//  FOLLOW-UP DE REATIVAÇÃO (durável — sobrevive a redeploy)
+//  Guarda leadData.followUpDueAt e um varredor dispara os vencidos.
+// =============================================================
+const TEMPO_INATIVIDADE = 30 * 60 * 1000; // 30 min sem resposta → reativação
+const FOLLOWUP_SWEEP    = 2 * 60 * 1000;  // varre a cada 2 min
+
+function agendarFollowUpReativacao(leadData) {
+    if (leadData.finalizado) { leadData.followUpDueAt = null; return; }
+    leadData.followUpDueAt = Date.now() + TEMPO_INATIVIDADE;
+}
+
+function montarMsgReativacao(leadData) {
+    const proximo = determinarProximoCampo(leadData);
+    if (!proximo) return null;
+    const nome = leadData.nome?.split(' ')[0] || '';
+    const oi = nome ? `Oi ${nome}` : 'Oi';
+    if (proximo.campo === 'finalidade')      return `${oi}! Ainda por aí? Me conta pra que você quer a moto no dia a dia que eu te ajudo a achar a certa 😊`;
+    if (proximo.campo === 'transporteAtual') return `${oi}, ainda por aí? Como você tá se locomovendo hoje — Uber, ônibus, carro?`;
+    if (proximo.campo === 'gastoMensal')     return `${oi}, seguindo de onde paramos: mais ou menos quanto você gasta por mês com transporte hoje?`;
+    if (proximo.campo === 'modeloInteresse') return `${oi}, ainda por aí? Quer que eu te indique o modelo que mais encaixa no seu dia a dia?`;
+    if (proximo.campo === 'loja')            return `${oi}, pra eu já adiantar com o consultor: qual unidade fica melhor pra você — Matriz, Malvinas ou Monteiro?`;
+    return `${oi}, ainda por aí? Se quiser, seguimos de onde paramos que eu já organizo tudo pro nosso consultor 😊`;
+}
+
+async function dispararFollowUpReativacao(chatId, leadData) {
+    const msg = montarMsgReativacao(leadData);
+    leadData.followUpDueAt = null;
+    if (!msg || leadData.followUpUltimo === msg) {
+        try { await store.saveLead(chatId, leadData); } catch (_) {}
+        return;
+    }
+    leadData.followUpUltimo = msg;
+    try { await store.saveLead(chatId, leadData); } catch (_) {}
+    await enviarMensagem(chatId, msg);
+    console.log(`📩 Follow-up de reativação enviado para ${chatId}`);
+}
+
+async function varrerFollowUps() {
+    try {
+        const ids = await store.scanLeadIds();
+        const agora = Date.now();
+        for (const chatId of ids) {
+            if (processandoMensagem.has(chatId)) continue;
+            let leadData;
+            try { leadData = await store.getLead(chatId); } catch (_) { continue; }
+            if (!leadData || leadData.finalizado) continue;
+            if (!leadData.followUpDueAt || leadData.followUpDueAt > agora) continue;
+            await dispararFollowUpReativacao(chatId, leadData);
+        }
+    } catch (e) {
+        console.error('Erro no varredor de follow-up:', e.message);
+    }
+}
+setInterval(varrerFollowUps, FOLLOWUP_SWEEP).unref?.();
+
+// =============================================================
+//  IA — EXTRAÇÃO DE INFORMAÇÕES (gpt-4o-mini, temperatura 0)
+// =============================================================
+async function extrairInformacoesComIA(mensagem, campoAtual, historicoRecente = []) {
+    try {
+        const mensagemSanitizada = mensagem.replace(/[<>]/g, '').substring(0, 1000);
+        const prompt = promptExtracao({ mensagemSanitizada, campoAtual });
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [...historicoRecente, { role: 'user', content: prompt }],
+            temperature: 0,
+            response_format: { type: 'json_object' } // garante JSON válido (o prompt já pede JSON)
+        });
+        let res = completion.choices[0].message.content.trim();
+        if (res.includes('```')) res = res.replace(/```json?/g, '').replace(/```/g, '').trim();
+        return JSON.parse(res);
+    } catch (e) {
+        console.error('Erro ao extrair informações:', e.message);
+        return null;
+    }
+}
+
+// =============================================================
+//  IA — GERAÇÃO DE RESPOSTA (gpt-4o-mini, temperatura 0.7)
+// =============================================================
+async function gerarRespostaIA(leadData, mensagemCliente, proximoCampo, historicoRecente = [], expediente = null) {
+    const mensagemSanitizada = mensagemCliente.replace(/[<>]/g, '').substring(0, 1000);
+    const isInicioConversa = leadData.conversationHistory.length === 0;
+    const prompt = promptResposta({ isInicioConversa, mensagemSanitizada, proximoCampo, leadData, expediente });
+    const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            { role: 'system', content: SYSTEM_SDR },
+            ...historicoRecente,
+            { role: 'user', content: prompt }
+        ],
+        temperature: 0.7
+    });
+    return completion.choices[0].message.content.trim();
+}
+
+// A IA "enxerga" a imagem enviada pelo cliente (gpt-4o com visão) e descreve
+// o conteúdo para usar no atendimento. Retorna null se falhar.
+async function analisarImagem(mediaUrl) {
+    if (!mediaUrl) return null;
+    try {
+        const instrucao = `Você é atendente da Avelloz Campina (concessionária de motos). O cliente enviou esta imagem no WhatsApp durante o atendimento. Descreva de forma curta e útil (1 a 3 frases, tom natural, SEM markdown) o que é e o que há de relevante para entender a necessidade dele:
+- Se for uma foto de moto (dele ou de um modelo), diga o que dá pra entender (modelo/estado/cor, se dá pra saber).
+- Se for um PRINT de conversa, anúncio ou simulação, resuma do que se trata.
+- Se for um documento (CNH, comprovante, print de dados), diga o que é sem transcrever dados sensíveis.
+Não invente o que não dá pra ver.`;
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{
+                role: 'user',
+                content: [
+                    { type: 'text', text: instrucao },
+                    { type: 'image_url', image_url: { url: mediaUrl } }
+                ]
+            }],
+            max_tokens: 300,
+            temperature: 0.3
+        });
+        return completion.choices[0].message.content.trim();
+    } catch (e) {
+        console.error('❌ Erro ao analisar imagem (visão):', e.message);
+        return null;
+    }
+}
+
+// Resposta quando o lead JÁ foi encaminhado ao especialista: tira dúvidas
+// pontuais de forma natural, sem refazer a qualificação nem repetir o resumo.
+async function gerarRespostaPosEncaminhamento(leadData, mensagemCliente, historicoRecente = []) {
+    const fallback = 'Já repassei tudo pro nosso consultor, ele continua seu atendimento aqui rapidinho 😊 Se quiser adiantar algo, pode me contar que eu anoto pro time. Ficou alguma dúvida sobre a moto?';
+    try {
+        const prompt = `Este lead já foi ENCAMINHADO a um consultor humano da Avelloz Campina. Ele acabou de dizer: "${String(mensagemCliente).replace(/[<>]/g, '').substring(0, 600)}".
+Responda de forma breve, calorosa e útil (registro de WhatsApp, sem markdown, no máximo 1 emoji), SEMPRE terminando com uma pergunta:
+- Se for uma dúvida simples sobre as motos/condições, responda com o que você sabe.
+- Se depender do consultor (valor de parcela, aprovação de crédito, prazo de entrega, negociação), diga que ele já vai continuar o atendimento pra resolver.
+Nunca informe valor de parcela nem prometa prazo. Não refaça a qualificação e não repita o resumo.`;
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: 'Você é um consultor do time da Avelloz Campina. Escrita natural, curta, registro de WhatsApp.' },
+                ...historicoRecente,
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.6
+        });
+        return completion.choices[0].message.content.trim() || fallback;
+    } catch (e) {
+        console.error('❌ Erro na resposta pós-encaminhamento:', e.message);
+        return fallback;
+    }
+}
+
+// =============================================================
+//  ENCAMINHAMENTO PARA HUMANO
+// =============================================================
+async function encaminhar(chatId, leadData, departamento, mensagemCliente, historico, expediente = null) {
+    const exp = expediente || estaEmExpediente();
+    // Deixa a IA escrever o handoff de forma calorosa (usa o branch de qualificação completa)
+    leadData.qualificacaoCompleta = true;
+    let msg;
+    try {
+        msg = await gerarRespostaIA(leadData, mensagemCliente, null, historico, exp);
+    } catch (_) {
+        msg = exp.aberto
+            ? 'Perfeito! Já tô repassando tudo pro nosso consultor. Ele assume seu atendimento aqui rapidinho, combinado? 😊'
+            : `Perfeito, deixei tudo registrado! Nosso consultor te retorna ${exp.proximoExpediente}. Enquanto isso, ficou alguma dúvida sobre a moto? 😊`;
+    }
+    await enviarMensagem(chatId, msg);
+    leadData.conversationHistory.push({ role: 'assistant', content: msg });
+    await notificarEquipe(leadData, chatId, { departamento, tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE', proximoExpediente: exp.aberto ? null : exp.proximoExpediente });
+    leadData.finalizado = true;
+    leadData.followUpDueAt = null;
+}
+
+// =============================================================
+//  PROCESSAMENTO DE MENSAGEM
+// =============================================================
+async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, mediaUrl, mediaMimetype, quotedText, nomeContato }) {
+    if (processandoMensagem.get(chatId)) {
+        console.log(`⚠️ Já processando mensagem de ${chatId}. Ignorando.`);
+        return;
+    }
+    processandoMensagem.set(chatId, true);
+    const timeoutId = setTimeout(() => {
+        if (processandoMensagem.get(chatId)) {
+            console.log(`⏱️ Timeout: liberando processamento para ${chatId}`);
+            processandoMensagem.delete(chatId);
+        }
+    }, 60000);
+
+    // Lock cross-instância (Redis): impede que outro container processe o mesmo
+    // lead ao mesmo tempo. Sem Redis, é no-op (o lock em memória acima já basta).
+    const lockRedis = await store.acquireLock(chatId, 60000);
+    if (!lockRedis) {
+        console.log(`🔒 ${chatId} já está sendo processado por outra instância — pulando.`);
+        clearTimeout(timeoutId);
+        processandoMensagem.delete(chatId);
+        return;
+    }
+
+    let leadData = null;
+    try {
+        leadData = await store.getLead(chatId);
+        // Reset automático por inatividade: se passou do limite (padrão 24h) sem
+        // interação, descarta o atendimento antigo e começa um novo do zero.
+        if (leadData && leadData.ultimaInteracao && (Date.now() - leadData.ultimaInteracao) > RESET_INATIVIDADE) {
+            console.log(`🕛 ${chatId}: inativo há mais de ${(RESET_INATIVIDADE / 3600000).toFixed(0)}h — reiniciando atendimento.`);
+            await store.deleteLead(chatId);
+            leadData = null;
+        }
+        if (!leadData) leadData = { conversationHistory: [] };
+        if (nomeContato && !leadData.nome) leadData.nome = nomeContato;
+        if (contactId && !leadData.contactId) leadData.contactId = contactId; // p/ criar oportunidade no CRM ao agendar
+        leadData.ultimaInteracao = Date.now(); // marca esta interação
+        leadData.followUpDueAt = null; // nova mensagem cancela reativação pendente
+
+        // Mídia (imagem/vídeo/documento) já registra o turno do cliente no
+        // histórico com uma descrição rica; quando isso acontece, marcamos aqui
+        // para NÃO empurrar de novo o texto-placeholder no fim (evita duplicar).
+        let usuarioNoHistorico = false;
+
+        // Reset
+        if (String(texto).toLowerCase() === '/reset') {
+            await store.deleteLead(chatId);
+            leadData = null;
+            await enviarMensagem(chatId, '🔄 Conversa resetada! Vamos começar de novo 😊');
+            return;
+        }
+
+        // --- Blindagem anti-loop (contra outras IAs / auto-respondedores) ---
+        // Se o contato dispara muitas mensagens numa janela curta, ou repete a
+        // mesma mensagem, PAUSA as respostas — evita ping-pong infinito com outro
+        // bot (ex.: IA da operadora). Cobre também o caminho pós-encaminhamento.
+        {
+            const agoraMs = Date.now();
+            leadData.turnosTs = (leadData.turnosTs || []).filter(t => agoraMs - t < LOOP_JANELA_MS);
+            leadData.turnosTs.push(agoraMs);
+            if (leadData.turnosTs.length <= 2) leadData.loopAvisado = false; // conversa normalizou
+            const textoNorm = String(texto || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 200);
+            leadData.ultimasMsgs = leadData.ultimasMsgs || [];
+            const repetida = textoNorm.length > 1 && leadData.ultimasMsgs.filter(t => t === textoNorm).length >= 2;
+            leadData.ultimasMsgs.push(textoNorm);
+            if (leadData.ultimasMsgs.length > 6) leadData.ultimasMsgs.shift();
+
+            if (leadData.turnosTs.length > LOOP_MAX_TURNOS || repetida) {
+                if (!leadData.loopAvisado) {
+                    console.warn(`🔁 Possível loop/bot em ${chatId} (${leadData.turnosTs.length} msgs/${LOOP_JANELA_MS / 60000}min${repetida ? ', msg repetida' : ''}) — pausando respostas.`);
+                    if (EQUIPE_NUMERO) { try { await ccPush(EQUIPE_NUMERO, { body: `⚠️ Possível loop com outro bot/IA no contato ${chatId}. A IA pausou as respostas para não entrar em ping-pong. Verificar manualmente.` }); } catch (_) {} }
+                    leadData.loopAvisado = true;
+                }
+                return; // não responde — corta o loop
+            }
+        }
+
+        // Lead já encaminhado → só tira dúvidas pontuais, sem refazer o funil
+        if (leadData.finalizado) {
+            const histPos = leadData.conversationHistory.slice(-30).map(h => ({
+                role: h.role === 'user' ? 'user' : 'assistant', content: h.content
+            }));
+            const respPos = await gerarRespostaPosEncaminhamento(leadData, texto, histPos);
+            await enviarMensagensQuebradas(chatId, respPos);
+            leadData.conversationHistory.push({ role: 'user', content: texto });
+            leadData.conversationHistory.push({ role: 'assistant', content: respPos });
+            return;
+        }
+
+        // Imagem → a IA ENXERGA (visão gpt-4o) e usa o conteúdo na resposta.
+        if (tipo === 'image') {
+            const desc = await analisarImagem(mediaUrl);
+            if (desc) {
+                leadData.analiseImagem = desc; // consumido na geração da resposta
+                console.log(`🖼️ Visão: ${desc}`);
+                leadData.conversationHistory.push({ role: 'user', content: `[O cliente enviou uma imagem] — ${desc}` });
+            } else {
+                leadData.conversationHistory.push({ role: 'user', content: '[O cliente enviou uma imagem]' });
+            }
+            texto = 'Enviei uma imagem.';
+            usuarioNoHistorico = true;
+        }
+
+        // Documento (PDF/planilha/arquivo) → registra p/ o especialista (não é imagem).
+        // Acusa o recebimento e ENCERRA o turno (sem gerar outra mensagem em seguida);
+        // a próxima mensagem do cliente retoma a qualificação normalmente.
+        if (tipo === 'document') {
+            const ack = 'Recebi o arquivo! Vou deixar registrado pro nosso consultor analisar junto com você. Quer me adiantar do que se trata? 😊';
+            await enviarMensagem(chatId, ack);
+            leadData.conversationHistory.push({ role: 'user', content: '[O cliente enviou um documento]' });
+            leadData.conversationHistory.push({ role: 'assistant', content: ack });
+            return;
+        }
+
+        // Vídeo → transcreve o áudio do vídeo (Whisper aceita mp4) p/ entender o que é falado.
+        if (tipo === 'video') {
+            let videoBuffer = null;
+            try {
+                if (mediaBase64) videoBuffer = Buffer.from(mediaBase64, 'base64');
+                else if (mediaUrl) {
+                    const resp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 60000 });
+                    videoBuffer = Buffer.from(resp.data);
+                }
+            } catch (e) { console.error('❌ Erro ao baixar vídeo:', e.message); }
+
+            let fala = '';
+            if (videoBuffer) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', videoBuffer, { filename: 'video.mp4', contentType: mediaMimetype || 'video/mp4' });
+                    formData.append('model', 'whisper-1');
+                    const tr = await axios.post('https://api.openai.com/v1/audio/transcriptions', formData, {
+                        headers: { ...formData.getHeaders(), Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+                    });
+                    fala = (tr.data.text || '').trim();
+                } catch (e) { console.error('❌ Erro ao transcrever vídeo:', e.message); }
+            }
+            if (fala) {
+                console.log(`🎬 Vídeo transcrito: "${fala}"`);
+                leadData.conversationHistory.push({ role: 'user', content: `[O cliente enviou um vídeo] Fala no vídeo: ${fala}` });
+                texto = fala;
+            } else {
+                leadData.conversationHistory.push({ role: 'user', content: '[O cliente enviou um vídeo]' });
+                texto = 'Enviei um vídeo.';
+            }
+            usuarioNoHistorico = true;
+        }
+
+        // Áudio → transcrição (Whisper). Se falhar, pede texto.
+        if (tipo === 'audio' || tipo === 'ptt') {
+            let audioBuffer = null;
+            try {
+                if (mediaBase64) {
+                    audioBuffer = Buffer.from(mediaBase64, 'base64');
+                } else if (mediaUrl) {
+                    const resp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 30000 });
+                    audioBuffer = Buffer.from(resp.data);
+                }
+            } catch (e) { console.error('❌ Erro ao baixar áudio:', e.message); }
+
+            if (audioBuffer) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', audioBuffer, { filename: 'audio.ogg', contentType: mediaMimetype || 'audio/ogg' });
+                    formData.append('model', 'whisper-1');
+                    const transcription = await axios.post('https://api.openai.com/v1/audio/transcriptions', formData, {
+                        headers: { ...formData.getHeaders(), Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+                    });
+                    texto = transcription.data.text;
+                    console.log(`📝 Transcrição: "${texto}"`);
+                } catch (e) {
+                    console.error('❌ Erro ao transcrever áudio:', e.message);
+                    await enviarMensagem(chatId, 'Recebi seu áudio! Por aqui prefiro que a gente converse por texto pra eu anotar tudo certinho. Pode me escrever? 😊');
+                    return;
+                }
+            } else {
+                await enviarMensagem(chatId, 'Recebi seu áudio, mas não consegui abrir por aqui. Pode me escrever, por favor? 😊');
+                return;
+            }
+        }
+
+        if (quotedText) {
+            texto = `[RESPOSTA À MENSAGEM: "${quotedText}"]\n${texto}`;
+        }
+
+        // Expediente do time: define modo normal (transfere ao vivo) x plantão (agenda retorno)
+        const exp = estaEmExpediente();
+
+        // --- Extração ---
+        const proximoCampoAntes = determinarProximoCampo(leadData);
+        const historicoRecente = leadData.conversationHistory.slice(-6).map(h => ({
+            role: h.role === 'user' ? 'user' : 'assistant', content: h.content
+        }));
+        const extraido = await extrairInformacoesComIA(texto, proximoCampoAntes?.campo, historicoRecente.slice(-4));
+
+        // Sinais transitórios (valem só para esta resposta)
+        leadData.objecaoAtiva = null;
+        leadData.perguntouAgora = null;
+
+        if (extraido) {
+            aplicarCampos(leadData, extraido);
+            if (extraido.objecao) leadData.objecaoAtiva = extraido.objecao;
+            if (extraido.perguntou) leadData.perguntouAgora = true;
+            if (extraido.tipoContato) leadData.tipoContato = extraido.tipoContato;
+
+            // Detecta o PERFIL do cliente (para o gancho de dor) a partir do que
+            // foi dito. Reavalia sempre que ainda não há perfil ou quando o cliente
+            // corrigiu transporte/situação de moto/finalidade.
+            const corr = Array.isArray(extraido.correcao) ? extraido.correcao : [];
+            if (corr.includes('transporteAtual') || corr.includes('situacaoMoto') || corr.includes('finalidade')) {
+                leadData.perfilKey = null;
+            }
+            if (!leadData.perfilKey) {
+                leadData.perfilKey = detectarPerfil(
+                    [extraido.finalidade, extraido.transporteAtual, extraido.situacaoMoto, texto].filter(Boolean).join(' ')
+                );
+            }
+
+            // Cliente ATUAL pedindo pós-venda/assistência → encaminha para Pós-venda
+            if (extraido.tipoContato === 'cliente' && !leadData.finalizado) {
+                if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
+                await enviarMensagem(chatId, 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer qual unidade você comprou (Matriz, Malvinas ou Monteiro)?');
+                await notificarEquipe(leadData, chatId, { departamento: DEPARTAMENTOS.posvenda, tagExtra: 'CLIENTE ATUAL' });
+                leadData.finalizado = true;
+                return;
+            }
+
+            // Pediu explicitamente falar com humano → encaminha ao consultor (loja/geral)
+            if (extraido.querFalarComHumano && !leadData.finalizado) {
+                const hist = leadData.conversationHistory.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.content }));
+                if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
+                await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
+                return;
+            }
+        }
+
+        // --- Próximo passo + resposta ---
+        const proximoCampoDepois = determinarProximoCampo(leadData);
+
+        const respHist = leadData.conversationHistory.slice(-10).map(h => ({
+            role: h.role === 'user' ? 'user' : 'assistant', content: h.content
+        }));
+        let resposta;
+        try {
+            resposta = await gerarRespostaIA(leadData, texto, proximoCampoDepois, respHist, exp);
+        } catch (e) {
+            // Instabilidade na OpenAI: NÃO deixar o cliente sem resposta. Manda um
+            // fallback caloroso e encerra o turno (o que já foi extraído fica salvo;
+            // a próxima mensagem retoma a qualificação de onde parou).
+            console.error(`❌ Erro ao gerar resposta IA para ${chatId}:`, e.message);
+            await enviarMensagem(chatId, 'Opa, tive uma instabilidade rapidinha por aqui 😅 Pode me mandar de novo o que você disse?');
+            if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
+            return;
+        }
+
+        leadData.objecaoAtiva = null;    // consumidos
+        leadData.perguntouAgora = null;
+        leadData.analiseImagem = null;
+
+        await enviarMensagensQuebradas(chatId, resposta);
+        if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
+        leadData.conversationHistory.push({ role: 'assistant', content: resposta });
+        if (leadData.conversationHistory.length > 100) {
+            leadData.conversationHistory = leadData.conversationHistory.slice(-100);
+        }
+
+        // Qualificação completa → notifica a equipe (transbordo p/ a loja) e encerra.
+        if (leadData.qualificacaoCompleta && !leadData.finalizado) {
+            await notificarEquipe(leadData, chatId, {
+                departamento: departamentoLead(leadData),
+                tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE — AGENDAR RETORNO',
+                proximoExpediente: exp.aberto ? null : exp.proximoExpediente
+            });
+            leadData.finalizado = true;
+        } else if (!leadData.finalizado) {
+            agendarFollowUpReativacao(leadData);
+        }
+
+    } catch (e) {
+        console.error(`❌ Erro ao processar mensagem de ${chatId}:`, e);
+    } finally {
+        clearTimeout(timeoutId);
+        processandoMensagem.delete(chatId);
+        if (leadData) {
+            try { await store.saveLead(chatId, leadData); }
+            catch (e) { console.error('❌ Erro ao salvar estado da conversa:', e.message); }
+        }
+        await store.releaseLock(chatId);
+    }
+}
+
+// =============================================================
+//  FILA SERIAL POR CLIENTE + AGRUPAMENTO DE MENSAGENS RÁPIDAS
+//  No WhatsApp o cliente manda várias mensagens seguidas. Em vez de
+//  processar a primeira e DESCARTAR as demais (o lock antigo fazia isso),
+//  enfileiramos tudo por número e processamos em série. Mensagens de TEXTO
+//  em sequência são agrupadas num só turno (debounce AGRUPAR_MS); mídia é
+//  processada assim que chega (mas ainda em série, nunca descartada).
+// =============================================================
+const filaPorChat   = new Map(); // chatId -> [parsed, ...] aguardando processamento
+const debounceTimers = new Map(); // chatId -> timer de agrupamento de texto
+
+function enfileirar(parsed) {
+    const { chatId } = parsed;
+    const fila = filaPorChat.get(chatId) || [];
+    fila.push(parsed);
+    filaPorChat.set(chatId, fila);
+
+    if (parsed.tipo === 'text') {
+        // Espera um instante juntando mensagens rápidas antes de drenar.
+        if (debounceTimers.has(chatId)) clearTimeout(debounceTimers.get(chatId));
+        debounceTimers.set(chatId, setTimeout(() => {
+            debounceTimers.delete(chatId);
+            drenarFila(chatId);
+        }, AGRUPAR_MS));
+    } else {
+        // Mídia não espera: cancela o debounce pendente e drena já.
+        if (debounceTimers.has(chatId)) { clearTimeout(debounceTimers.get(chatId)); debounceTimers.delete(chatId); }
+        drenarFila(chatId);
+    }
+}
+
+// Junta as mensagens de TEXTO consecutivas no início da fila num único "turno".
+// Mídia é sempre uma unidade isolada (não dá pra concatenar imagem+áudio+texto).
+function proximaUnidade(fila) {
+    if (fila[0].tipo !== 'text') return fila.shift();
+    const textos = [], ids = [];
+    let nome = '', quoted = null, contactId = null;
+    while (fila.length && fila[0].tipo === 'text') {
+        const m = fila.shift();
+        if (m.texto) textos.push(m.texto);
+        if (m.msgId) ids.push(m.msgId);
+        if (!nome && m.nomeContato) nome = m.nomeContato;
+        if (!quoted && m.quotedText) quoted = m.quotedText;
+        if (!contactId && m.contactId) contactId = m.contactId;
+    }
+    return {
+        chatId: null, // preenchido pelo chamador
+        contactId,
+        tipo: 'text',
+        texto: textos.join('\n'),
+        msgId: ids.join(',') || null,
+        nomeContato: nome,
+        quotedText: quoted,
+        mediaBase64: null, mediaUrl: null, mediaMimetype: null
+    };
+}
+
+async function drenarFila(chatId) {
+    if (processandoMensagem.get(chatId)) return; // já rodando: será drenado ao terminar
+    const fila = filaPorChat.get(chatId);
+    if (!fila || !fila.length) return;
+
+    const unidade = proximaUnidade(fila);
+    unidade.chatId = chatId;
+    try {
+        await processarMensagem(unidade);
+    } catch (e) {
+        console.error(`❌ Erro ao drenar fila de ${chatId}:`, e.message);
+    }
+
+    // Limpa a fila vazia; se algo chegou durante o processamento, drena de novo.
+    const restante = filaPorChat.get(chatId);
+    if (restante && restante.length) drenarFila(chatId);
+    else filaPorChat.delete(chatId);
+}
+
+// Detecta se a mensagem veio de um GRUPO. O whatsmeow expõe Info.IsGroup e
+// Info.Chat (JID do chat); grupo = JID termina em "@g.us". Cobrimos também
+// variantes de payload plano (from/remoteJid/chatId/isGroup).
+function ehGrupo(body = {}, msg = {}) {
+    const info = msg.raw?.Info || {};
+    // Sinal nativo do ChatClean (o mais confiável): o ticket marca grupo.
+    if (body.ticket?.isGroup === true || body.ticket?.status === 'group') return true;
+    if (msg.ticket?.isGroup === true || msg.ticket?.status === 'group') return true;
+    // Sinais do whatsmeow / formato plano.
+    if (info.IsGroup === true || body.isGroup === true || msg.isGroup === true) return true;
+    const candidatos = [
+        info.Chat, info.ChatJID, info.chat,
+        msg.chatId, msg.from, msg.remoteJid,
+        body.chatId, body.from, body.remoteJid, body.remotejid,
+        body.contact?.remoteJid, body.contact?.jid
+    ];
+    return candidatos.some(j => typeof j === 'string' && j.includes('@g.us'));
+}
+
+// Ticket do payload (pode vir em body.ticket ou message.ticket, conforme o canal).
+function getTicket(body = {}, msg = {}) {
+    return body.ticket || msg.ticket || {};
+}
+function ticketStatus(body = {}, msg = {}) {
+    return getTicket(body, msg).status || null;
+}
+// A IA atua como bot de fila: responde enquanto NINGUÉM humano assumiu o ticket.
+// - status "pending" (na fila) → responde
+// - status "closed" → não responde
+// - ticket com userId humano atribuído (a pessoa ACEITOU a conversa) → não responde
+// - sem status no payload → responde (compat)
+// Assim, no instante em que o atendente aceita (userId é atribuído / status muda),
+// a IA para — sem o risco de silenciar leads novos que chegem como "open".
+function deveResponderTicket(body = {}, msg = {}) {
+    if (!IA_SO_PENDENTES) return true;
+    const t = getTicket(body, msg);
+    if (t.userId) return false;             // humano ACEITOU (userId atribuído) → para
+    const st = t.status || null;
+    if (!st) return true;                   // sem status → compat
+    if (st === 'closed') return false;      // encerrado
+    return true;                            // pending / open sem humano → responde
+}
+
+// =============================================================
+//  WEBHOOK — PARSE DO PAYLOAD DO CHATCLEAN
+// =============================================================
+function parsePayload(body) {
+    try {
+        const normTipo = (t) => {
+            const v = String(t || 'text').toLowerCase();
+            if (['image', 'audio', 'ptt', 'document', 'text'].includes(v)) return v;
+            if (v === 'chat' || v === '') return 'text';
+            return v; // sticker/video/location → tratado como não-texto no /webhook
+        };
+
+        // Formato ChatClean: contact + message aninhados.
+        // O telefone real vem em message.raw.Info.SenderAlt (ex.: "558494610845@s.whatsapp.net").
+        if (body?.contact || (body?.message && typeof body.message === 'object' && !body.message.add)) {
+            const contato = body.contact || {};
+            const msg     = body.message || {};
+            if (msg.fromMe) return null; // ignora eco do próprio bot/atendente
+            if (IGNORAR_GRUPOS && ehGrupo(body, msg)) { console.log('👥 Mensagem de grupo ignorada'); return null; }
+            if (!deveResponderTicket(body, msg)) { console.log(`⏭️ Ticket "${ticketStatus(body, msg)}" (aceito/atendido por humano) — IA não responde`); return null; }
+            const senderAlt = msg.raw?.Info?.SenderAlt ? String(msg.raw.Info.SenderAlt).split('@')[0] : null;
+            // WABA (WhatsApp Oficial): o número do remetente vem em message.raw.from
+            // (não existe raw.Info.SenderAlt como no WhatsApp Web/whatsmeow).
+            const wabaFrom = msg.raw?.from || null;
+            const numero = contato.number || contato.phone || body.number || senderAlt || wabaFrom || msg.number;
+            const phone  = normalizarPhone(numero);
+            if (!phone) return null;
+            // contactId do CRM — usado para criar oportunidade no funil ao agendar.
+            const tk = getTicket(body, msg);
+            const contactId = msg.contactId || contato.id || tk.contactId || body.contactId || null;
+            return {
+                chatId:        phone,
+                contactId:     contactId ? Number(contactId) : null,
+                msgId:         msg.id ? String(msg.id) : (msg.messageId ? String(msg.messageId) : null),
+                texto:         String(msg.body || msg.text || '').trim(),
+                tipo:          normTipo(msg.type || msg.mediaType),
+                mediaBase64:   msg.mediaBase64 || msg.base64 || null,
+                mediaUrl:      msg.mediaUrl || null,
+                mediaMimetype: msg.mimetype || msg.raw?.Message?.imageMessage?.mimetype || null,
+                quotedText:    msg.quotedMsg?.body || msg.quotedMsg?.text || null,
+                nomeContato:   contato.name || msg.raw?.Info?.PushName || body.contactName || ''
+            };
+        }
+
+        // Formato plano (webhook/n8n simples): { number, type, body, contactName, id }
+        if (body?.number && (body?.body !== undefined || body?.type)) {
+            if (body.fromMe) return null;
+            if (IGNORAR_GRUPOS && ehGrupo(body)) { console.log('👥 Mensagem de grupo ignorada'); return null; }
+            if (!deveResponderTicket(body)) { console.log(`⏭️ Ticket "${ticketStatus(body)}" (aceito/atendido por humano) — IA não responde`); return null; }
+            const phone = normalizarPhone(body.number);
+            if (!phone) return null;
+            return {
+                chatId:        phone,
+                contactId:     body.contactId ? Number(body.contactId) : (body.contact?.id ? Number(body.contact.id) : null),
+                msgId:         body.id ? String(body.id) : null,
+                texto:         String(body.body || '').trim(),
+                tipo:          normTipo(body.type),
+                mediaBase64:   body.mediaBase64 || body.base64 || null,
+                mediaUrl:      body.mediaUrl || null,
+                mediaMimetype: body.mimetype || null,
+                quotedText:    body.quotedText || null,
+                nomeContato:   body.contactName || body.name || ''
+            };
+        }
+
+        // Formato numero_cliente/mensagem_cliente (disparo duplicado do ChatBot) → ignorado
+        if (body?.numero_cliente && body?.mensagem_cliente !== undefined) {
+            console.log('↩️ Ignorando disparo duplicado (formato numero_cliente)');
+            return null;
+        }
+
+        console.log('⚠️ Payload não reconhecido:', JSON.stringify(body, null, 2).slice(0, 800));
+        return null;
+    } catch (e) {
+        console.error('❌ Erro ao fazer parse do payload:', e.message);
+        return null;
+    }
+}
+
+const mensagensProcessadas = new Set(); // dedup de webhooks
+const TIPOS_SUPORTADOS = ['text', 'image', 'document', 'audio', 'ptt', 'video'];
+
+// Valida o token do webhook contra WEBHOOK_SECRET. Aceita no header
+// (x-webhook-token / Authorization: Bearer), na query (?token=) ou no path
+// (/webhook/<token>). Se WEBHOOK_SECRET estiver vazio, o webhook fica aberto
+// (compat) — CONFIGURE-O antes do go-live e aponte a URL do ChatClean para
+// https://.../webhook/<secret> (ou .../webhook?token=<secret>).
+function webhookAutorizado(req) {
+    if (!WEBHOOK_SECRET) return true;
+    const raw = req.headers['x-webhook-token'] || req.headers['authorization'] || req.query.token || req.params.token || '';
+    const token = String(raw).replace(/^Bearer\s+/i, '');
+    if (token.length !== WEBHOOK_SECRET.length) return false;
+    const a = Buffer.from(token.padEnd(128).slice(0, 128));
+    const b = Buffer.from(WEBHOOK_SECRET.padEnd(128).slice(0, 128));
+    return crypto.timingSafeEqual(a, b);
+}
+
+// Rate-limit por número (janela deslizante em memória, por instância).
+const rateHits = new Map(); // chatId -> [timestamps]
+function dentroDoLimite(chatId) {
+    if (!RATE_LIMIT_MSGS) return true; // desativado
+    const agora = Date.now();
+    const hits = (rateHits.get(chatId) || []).filter(t => agora - t < RATE_LIMIT_JANELA);
+    hits.push(agora);
+    rateHits.set(chatId, hits);
+    if (rateHits.size > 5000) { // poda defensiva
+        for (const [k, v] of rateHits) {
+            if (!v.length || agora - v[v.length - 1] > RATE_LIMIT_JANELA) rateHits.delete(k);
+        }
+    }
+    return hits.length <= RATE_LIMIT_MSGS;
+}
+
+async function handleWebhook(req, res) {
+    res.status(200).json({ status: 'ok' }); // responde rápido (evita retry do ChatClean)
+    try {
+        if (!webhookAutorizado(req)) {
+            console.warn('⚠️ Webhook com token inválido ou ausente — ignorado.');
+            return;
+        }
+
+        console.log('🔍 PAYLOAD RAW:', JSON.stringify(req.body, null, 2).slice(0, 4000));
+
+        const parsed = parsePayload(req.body);
+        if (!parsed) return;
+
+        console.log(`📩 Webhook de ${parsed.chatId} [${parsed.tipo}]: "${parsed.texto || '[mídia]'}"`);
+
+        if (!contatoPermitido(parsed.chatId)) {
+            console.log(`🚫 Contato ${parsed.chatId} fora da lista de teste — ignorado`);
+            return;
+        }
+
+        // Rate-limit por número (anti-spam / loop / proteção de custo OpenAI).
+        if (!dentroDoLimite(parsed.chatId)) {
+            console.warn(`🚦 Rate-limit: ${parsed.chatId} passou de ${RATE_LIMIT_MSGS}/${RATE_LIMIT_JANELA / 1000}s — ignorando.`);
+            return;
+        }
+
+        if (parsed.msgId) {
+            if (mensagensProcessadas.has(parsed.msgId)) {
+                console.log(`↩️ Mensagem duplicada (${parsed.msgId}) ignorada`);
+                return;
+            }
+            mensagensProcessadas.add(parsed.msgId);
+            if (mensagensProcessadas.size > 500) {
+                [...mensagensProcessadas].slice(0, 200).forEach(id => mensagensProcessadas.delete(id));
+            }
+        }
+
+        // Mídia não suportada (sticker, localização...) → fallback humanizado
+        if (!TIPOS_SUPORTADOS.includes(parsed.tipo)) {
+            await enviarMensagem(parsed.chatId, 'Pode me mandar por texto o que você precisa? Assim consigo te ajudar melhor 🙂');
+            return;
+        }
+
+        // Enfileira (nunca descarta): agrupa mensagens rápidas e processa em série.
+        enfileirar(parsed);
+    } catch (e) {
+        console.error('❌ Erro no handler do webhook:', e);
+    }
+}
+
+// Aceita o token embutido no path (/webhook/<secret>) ou em /webhook (header/query).
+app.post('/webhook', express.json({ limit: '10mb' }), handleWebhook);
+app.post('/webhook/:token', express.json({ limit: '10mb' }), handleWebhook);
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+});
+// GET de validação do webhook (alguns painéis testam a URL com GET antes de
+// disparar). Responde 200 tanto em /webhook quanto em /webhook/<token>, senão
+// a URL com o token no caminho daria 404 e o provedor não dispararia.
+const webhookPing = (req, res) => res.status(200).json({ status: 'ok' });
+app.get('/webhook', webhookPing);
+app.get('/webhook/:token', webhookPing);
+
+// Guard dos endpoints administrativos. Aceita a chave em ?key=, no header
+// x-admin-key ou Authorization: Bearer. Sem ADMIN_KEY configurada, BLOQUEIA
+// (nunca deixa /leads e /diag abertos ao público por omissão).
+function checarAdmin(req, res) {
+    if (!ADMIN_KEY) {
+        res.status(503).json({ erro: 'ADMIN_KEY não configurada no servidor' });
+        return false;
+    }
+    const raw = req.query.key || req.headers['x-admin-key'] || req.headers['authorization'] || '';
+    const key = String(raw).replace(/^Bearer\s+/i, '');
+    if (key !== ADMIN_KEY) {
+        res.status(401).json({ erro: 'não autorizado' });
+        return false;
+    }
+    return true;
+}
+
+// Diagnóstico de produção: confere expediente, Redis e config de Push/pipeline.
+// Não expõe segredos.
+app.get('/diag', async (req, res) => {
+    if (!checarAdmin(req, res)) return;
+    res.json({
+        ok: true,
+        expediente: estaEmExpediente(),
+        resetInatividadeHoras: RESET_INATIVIDADE / 3600000,
+        redis: store.isRedis(),
+        pushConfigurado: !!CC_PUSH_URL,
+        equipeNumero: !!EQUIPE_NUMERO,
+        pipeline: pipeline.diag()
+    });
+});
+
+// Histórico de leads qualificados (útil pra conferência rápida)
+app.get('/leads', async (req, res) => {
+    if (!checarAdmin(req, res)) return;
+    try {
+        const ids = await store.scanLeadIds();
+        const ativos = [];
+        for (const id of ids) {
+            try { const l = await store.getLead(id); if (l) ativos.push({ chatId: id, nome: l.nome, empresa: l.empresa, finalizado: !!l.finalizado }); } catch (_) {}
+        }
+        res.json({ total: ativos.length, ativos });
+    } catch (e) {
+        res.status(500).json({ erro: e.message });
+    }
+});
+
+// =============================================================
+//  INICIALIZAÇÃO
+// =============================================================
+app.listen(PORT, () => {
+    console.log('');
+    console.log('🚀 ================================');
+    console.log(`🏍️  IA ${EMPRESA_INFO.nome} — VIA CHATCLEAN (Webhook + Push)`);
+    console.log(`📡 Servidor rodando na porta ${PORT}`);
+    console.log(`🔗 Webhook: https://SEU_DOMINIO/webhook`);
+    console.log(`❤️  Health:  https://SEU_DOMINIO/health`);
+    console.log('🚀 ================================');
+    console.log('');
+    if (!CC_PUSH_URL)   console.warn('⚠️  CC_PUSH_URL não configurado — a IA não conseguirá responder.');
+    if (!EQUIPE_NUMERO) console.warn('ℹ️  EQUIPE_NUMERO não configurado — resumo de lead só irá como nota interna.');
+    if (!ADMIN_KEY)     console.warn('🔒 ADMIN_KEY não configurada — /leads e /diag ficarão BLOQUEADOS (503). Defina para liberar o acesso administrativo.');
+    if (!WEBHOOK_SECRET) console.warn('🔓 WEBHOOK_SECRET vazio — /webhook está ABERTO. Antes do go-live, defina-o e aponte a URL do ChatClean para /webhook/<secret>.');
+    if (!process.env.OPENAI_API_KEY) { console.error('❌ OPENAI_API_KEY não configurada no .env!'); process.exit(1); }
+    console.log(store.isRedis()
+        ? '🗄️  Estado das conversas: Redis (persistente)'
+        : '🗄️  Estado das conversas: memória (defina REDIS_URL para persistir entre restarts)');
+});
+
+async function shutdown(signal) {
+    console.log(`\n⚠️  Recebido sinal ${signal}. Encerrando servidor...`);
+    process.exit(0);
+}
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGUSR2', () => shutdown('SIGUSR2'));

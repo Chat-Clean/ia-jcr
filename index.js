@@ -96,11 +96,20 @@ function nucleoNumero(n) {
     return d;
 }
 
-// true se o número está na allow-list (tolerante ao 9º dígito). Lista vazia = libera todos.
+// true se o número está na allow-list. Tolerante ao 9º dígito e ao ID de
+// dispositivo do WhatsApp grudado no fim: o JID "558494610845:59" às vezes
+// chega com os dois-pontos já removidos, virando "55849461084559" — nesse caso
+// o número da lista continua sendo o começo do que veio. Lista vazia = todos.
 function contatoPermitido(numero) {
     if (!IA_ALLOWED_CONTACTS.length) return true;
     const alvo = nucleoNumero(numero);
-    return IA_ALLOWED_CONTACTS.some(a => nucleoNumero(a) === alvo);
+    return IA_ALLOWED_CONTACTS.some(a => {
+        const permitido = nucleoNumero(a);
+        if (!permitido) return false;
+        if (permitido === alvo) return true;
+        const sobra = alvo.length - permitido.length; // ID de dispositivo tem 1 ou 2 dígitos
+        return sobra > 0 && sobra <= 2 && alvo.startsWith(permitido);
+    });
 }
 
 // =============================================================
@@ -854,7 +863,14 @@ function parsePayload(body) {
             // WABA (WhatsApp Oficial): o número do remetente vem em message.raw.from
             // (não existe raw.Info.SenderAlt como no WhatsApp Web/whatsmeow).
             const wabaFrom = msg.raw?.from || null;
-            const numero = contato.number || contato.phone || body.number || senderAlt || wabaFrom || msg.number;
+            // O SenderAlt do whatsmeow tem PRIORIDADE: vem como JID completo
+            // ("558494610845:59@s.whatsapp.net"), então o ID do dispositivo (:59)
+            // é cortado corretamente por normalizarPhone. O contact.number do CRM
+            // às vezes já chega com esse sufixo grudado ("55849461084559"), sem os
+            // dois-pontos — e aí não há como separar o telefone do dispositivo.
+            // Em contas com LID, o SenderAlt também é quem carrega o telefone real
+            // (Chat/Sender vêm como "14079406125304@lid").
+            const numero = senderAlt || contato.number || contato.phone || body.number || wabaFrom || msg.number;
             const phone  = normalizarPhone(numero);
             if (!phone) return null;
             // contactId do CRM — usado para criar oportunidade no funil ao agendar.
@@ -1058,7 +1074,15 @@ app.get('/leads', async (req, res) => {
 // =============================================================
 //  INICIALIZAÇÃO
 // =============================================================
-app.listen(PORT, () => {
+// Falha RÁPIDO e claro se faltar a chave da OpenAI: antes era checado dentro do
+// callback do listen, ou seja, a porta abria, o healthcheck passava e só então o
+// processo morria — virando crash-loop difícil de ler no log do container.
+if (!process.env.OPENAI_API_KEY) {
+    console.error('❌ OPENAI_API_KEY não configurada — a IA não sobe. Defina a variável de ambiente e faça o deploy de novo.');
+    process.exit(1);
+}
+
+const server = app.listen(PORT, () => {
     console.log('');
     console.log('🚀 ================================');
     console.log(`🏍️  IA ${EMPRESA_INFO.nome} — VIA CHATCLEAN (Webhook + Push)`);
@@ -1071,16 +1095,42 @@ app.listen(PORT, () => {
     if (!EQUIPE_NUMERO) console.warn('ℹ️  EQUIPE_NUMERO não configurado — resumo de lead só irá como nota interna.');
     if (!ADMIN_KEY)     console.warn('🔒 ADMIN_KEY não configurada — /leads e /diag ficarão BLOQUEADOS (503). Defina para liberar o acesso administrativo.');
     if (!WEBHOOK_SECRET) console.warn('🔓 WEBHOOK_SECRET vazio — /webhook está ABERTO. Antes do go-live, defina-o e aponte a URL do ChatClean para /webhook/<secret>.');
-    if (!process.env.OPENAI_API_KEY) { console.error('❌ OPENAI_API_KEY não configurada no .env!'); process.exit(1); }
     console.log(store.isRedis()
         ? '🗄️  Estado das conversas: Redis (persistente)'
         : '🗄️  Estado das conversas: memória (defina REDIS_URL para persistir entre restarts)');
 });
 
+// Encerramento limpo: fecha o servidor HTTP (para de aceitar conexões novas e
+// deixa as em andamento terminarem) antes de sair. Se algo travar, sai mesmo
+// assim em 8s para não deixar o container pendurado.
+//
+// Se o container morre e este log NÃO aparece, o sinal não chegou ao Node — é o
+// caso de quando a plataforma inicia o app por "npm start": o npm vira PID 1,
+// recebe o SIGTERM e não repassa, e o log fica só com o
+// "npm error signal SIGTERM". Nesse cenário, configure o start command como
+// "node index.js" (é o que o Dockerfile já faz).
+let encerrando = false;
 async function shutdown(signal) {
+    if (encerrando) return;
+    encerrando = true;
     console.log(`\n⚠️  Recebido sinal ${signal}. Encerrando servidor...`);
-    process.exit(0);
+    setTimeout(() => process.exit(0), 8000).unref();
+    server.close(() => {
+        console.log('✅ Servidor encerrado.');
+        process.exit(0);
+    });
 }
+// Rede de segurança: um erro solto (promessa rejeitada sem catch, falha de
+// socket do Redis/axios) NÃO pode derrubar o atendimento inteiro. O Node encerra
+// o processo por padrão nesses casos, o que no container vira restart e 502 pra
+// quem estiver conversando. Aqui a gente loga e segue servindo.
+process.on('unhandledRejection', (motivo) => {
+    console.error('❌ Promessa rejeitada sem tratamento:', motivo?.stack || motivo);
+});
+process.on('uncaughtException', (erro) => {
+    console.error('❌ Exceção não capturada:', erro?.stack || erro);
+});
+
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGUSR2', () => shutdown('SIGUSR2'));

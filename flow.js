@@ -17,14 +17,46 @@ const CAMPOS_EXTRAS = ['nome', 'nomeCompleto', 'cpf', 'dataNascimento', 'telefon
 
 // State machine: retorna o próximo campo a coletar (com a instrução p/ o modelo)
 // ou null quando a qualificação está completa (marca leadData.qualificacaoCompleta).
+// Modelo citado num texto (usado para saber qual moto a IA já apresentou).
+// A ordem importa: AZX160 e AZ125 são testados antes de AZ1, senão "AZ1"
+// casaria dentro de "AZ125".
+function detectarModeloMencionado(texto) {
+    if (!texto) return null;
+    if (/\bAZX\s?-?\s?160\b/i.test(texto)) return 'AZX160';
+    if (/\bAZ\s?-?\s?125\b/i.test(texto)) return 'AZ125';
+    if (/\bAZ\s?-?\s?1\b/i.test(texto))   return 'AZ1';
+    return null;
+}
+
 function determinarProximoCampo(leadData) {
+    // A IA já recomendou uma moto e o cliente SEGUIU ADIANTE (falou de pagamento,
+    // escolheu loja ou passou dados) sem dizer "quero essa" com todas as letras.
+    // Sem isto o fluxo fica preso em modeloInteresse: a cada mensagem a instrução
+    // volta a ser "recomende um modelo", e a IA acaba trocando de moto sozinha,
+    // contradizendo o preço que ela mesma acabou de dar.
+    // Também adota quando a moto já apareceu em DUAS mensagens da IA sem o cliente
+    // recusar: senão ela fica presa em "é essa que você quer levar?" a cada turno.
+    if (!leadData.modeloInteresse && leadData.modeloApresentado) {
+        const vezesApresentada = (leadData.conversationHistory || [])
+            .filter(h => h.role === 'assistant' && detectarModeloMencionado(h.content) === leadData.modeloApresentado)
+            .length;
+        if (vezesApresentada >= 2 || leadData.formaPagamento || leadData.loja || leadData.cpf || leadData.corModelo) {
+            leadData.modeloInteresse = leadData.modeloApresentado;
+        }
+    }
     if (!leadData.finalidade)      return { campo: 'finalidade',      pergunta: 'Pergunte pra que ele quer a moto (trabalhar, economizar, passear, pra esposa) e se já viu algum modelo nosso (passo 2 — interesse).' };
     if (!leadData.transporteAtual) return { campo: 'transporteAtual', pergunta: 'Pergunte como ele se locomove HOJE: carro, Uber, ônibus, carona ou moto alugada (passo 3 — diagnóstico). Uma coisa de cada vez.' };
     if (!leadData.gastoMensal)     return { campo: 'gastoMensal',     pergunta: 'Pergunte quanto ele gasta por mês nesse transporte (faça ele dizer o número em reais) e o quanto de tempo perde esperando/no trânsito.' };
     if (!leadData.situacaoMoto)    return { campo: 'situacaoMoto',    pergunta: 'Descubra se ele já tem moto e a situação (própria, alugada, velha, manutenção cara). Se roda de app, pergunte quanto paga de aluguel por semana/mês.' };
-    if (!leadData.modeloInteresse) return { campo: 'modeloInteresse', pergunta: 'Diagnóstico feito: mostre a conta (o gasto dele projetado no ano) e recomende o modelo que encaixa (AZ1 economia, AZ125 equilíbrio, AZX160 potência). Confirme qual interessou.' };
-    if (!leadData.formaPagamento)  return { campo: 'formaPagamento',  pergunta: 'Pergunte qual forma de pagamento faz mais sentido: cartão (até 21x), financiamento (entrada zero em até 48x dependendo do CPF), consórcio ou à vista.' };
-    if (!leadData.loja)            return { campo: 'loja',            pergunta: 'Pergunte qual unidade fica melhor pra ele: Matriz, Malvinas (Campina Grande) ou Monteiro. Identificar a loja é OBRIGATÓRIO antes de transferir.' };
+    if (!leadData.modeloInteresse) return { campo: 'modeloInteresse', pergunta: leadData.modeloApresentado
+        ? `Você JÁ recomendou a ${leadData.modeloApresentado} e JÁ mostrou a conta do gasto anual. NÃO recomende outro modelo, NÃO repita o preço e NÃO refaça o cálculo: apenas confirme, numa pergunta curta, se é essa mesma que ele quer levar.`
+        : 'Diagnóstico feito: mostre a conta (o gasto dele projetado no ano) UMA vez e recomende o modelo que encaixa (AZ1 economia, AZ125 equilíbrio, AZX160 potência). Confirme qual interessou.' };
+    // A forma de pagamento NÃO bloqueia o fechamento depois que o cliente escolheu
+    // a unidade: quem fecha a condição é o consultor da loja. Insistir aqui fazia a
+    // IA voltar atrás e reperguntar pagamento depois de o cliente já ter decidido
+    // onde comprar — que foi o que travou o atendimento no print.
+    if (!leadData.formaPagamento && !leadData.loja) return { campo: 'formaPagamento',  pergunta: 'Pergunte qual forma de pagamento faz mais sentido: cartão (até 21x), financiamento (entrada zero em até 48x dependendo do CPF), consórcio ou à vista.' };
+    if (!leadData.loja)            return { campo: 'loja',            pergunta: 'Pergunte qual unidade fica melhor pra ele, citando SEMPRE as TRÊS: Matriz e Malvinas (Campina Grande) e Monteiro. Nunca ofereça só duas. Identificar a loja é OBRIGATÓRIO antes de transferir.' };
     leadData.qualificacaoCompleta = true;
     return null;
 }
@@ -70,4 +102,4 @@ function detectarPerfil(texto) {
     return null;
 }
 
-module.exports = { CAMPOS, CAMPOS_EXTRAS, determinarProximoCampo, aplicarCampos, detectarPerfil };
+module.exports = { CAMPOS, CAMPOS_EXTRAS, determinarProximoCampo, aplicarCampos, detectarPerfil, detectarModeloMencionado };

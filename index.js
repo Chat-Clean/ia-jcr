@@ -63,7 +63,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, DEPARTAMENTO_IDS, departamentoId, lojaParaDepartamento, OFICINA } = require('./data');
 const { SYSTEM_SDR, promptExtracao, promptResposta } = require('./prompts');
-const { determinarProximoCampo, aplicarCampos, detectarPerfil } = require('./flow');
+const { determinarProximoCampo, aplicarCampos, detectarPerfil, detectarModeloMencionado } = require('./flow');
 
 // Departamento de transbordo do lead = a loja que ele escolheu (obrigatória
 // no fluxo). Sem loja identificada, cai no Comercial geral.
@@ -85,6 +85,11 @@ function normalizarPhone(phone) {
     // grudaria no número (…6446 + 24). Pega só a parte antes de ':' e '@'.
     return String(phone).split('@')[0].split(':')[0].replace(/\D/g, '');
 }
+
+// Pedidos INEQUÍVOCOS de transferência. De propósito não inclui "quero falar com
+// humano": essa frase aparece negada com frequência ("não quero falar com humano")
+// e o julgamento de intenção nesse caso fica com a IA, na extração.
+const PEDE_TRANSFERENCIA = /\b(me\s+transfir\w*|pode(m)?\s+transferir|quero\s+ser\s+transferid\w*|me\s+passa\s+(pro|para\s+o?)\s*(vendedor|consultor|atendente)|chama\s+(um\s+)?(vendedor|consultor|atendente))\b/i;
 
 // Núcleo canônico de um número BR p/ COMPARAÇÃO (ignora o 9º dígito de celular).
 // Ex.: 5584994610845 (13) e 558494610845 (12) viram o mesmo núcleo → casam.
@@ -655,8 +660,11 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 return;
             }
 
-            // Pediu explicitamente falar com humano → encaminha ao consultor (loja/geral)
-            if (extraido.querFalarComHumano && !leadData.finalizado) {
+            // Pediu explicitamente falar com humano → encaminha ao consultor (loja/geral).
+            // O regex é rede de segurança: numa frase como "não quero falar com
+            // humano, me transfira" a negação confunde o modelo e ele devolve false,
+            // deixando o cliente falando sozinho. Só padrões inequívocos entram aqui.
+            if ((extraido.querFalarComHumano || PEDE_TRANSFERENCIA.test(texto)) && !leadData.finalizado) {
                 const hist = leadData.conversationHistory.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.content }));
                 if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
                 await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
@@ -666,6 +674,17 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
 
         // --- Próximo passo + resposta ---
         const proximoCampoDepois = determinarProximoCampo(leadData);
+
+        // Quantas vezes seguidas estamos pedindo o MESMO dado. Quando o cliente
+        // desconversa ("sei lá", "acho bom"), o campo continua vazio e a IA
+        // repetiria a mesma pergunta indefinidamente — o prompt usa este número
+        // para reformular na 2ª vez e desistir do assunto na 3ª.
+        if (proximoCampoDepois && leadData.ultimoCampoPerguntado === proximoCampoDepois.campo) {
+            leadData.vezesMesmoCampo = (leadData.vezesMesmoCampo || 1) + 1;
+        } else {
+            leadData.vezesMesmoCampo = 1;
+        }
+        leadData.ultimoCampoPerguntado = proximoCampoDepois ? proximoCampoDepois.campo : null;
 
         const respHist = leadData.conversationHistory.slice(-10).map(h => ({
             role: h.role === 'user' ? 'user' : 'assistant', content: h.content
@@ -687,6 +706,11 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
         leadData.perguntouAgora = null;
         leadData.assuntoAgora = null;
         leadData.analiseImagem = null;
+
+        // Guarda a moto que a IA acabou de apresentar. É isso que permite o fluxo
+        // seguir quando o cliente aceita a recomendação sem dizer "quero a AZ1".
+        const modeloNaResposta = detectarModeloMencionado(resposta);
+        if (modeloNaResposta) leadData.modeloApresentado = modeloNaResposta;
 
         await enviarMensagensQuebradas(chatId, resposta);
         if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });

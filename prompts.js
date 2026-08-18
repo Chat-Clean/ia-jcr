@@ -8,7 +8,7 @@
 //  - promptExtracao: extração de campos (gpt-4o-mini, temp 0).
 // =============================================================
 
-const { MODELOS, FORMAS_PAGAMENTO, LOJAS, PERFIS, OBJECOES } = require('./data');
+const { MODELOS, FORMAS_PAGAMENTO, LOJAS, PERFIS, OBJECOES, OFICINA, INDICACAO } = require('./data');
 
 // Blocos montados a partir do data.js (mantém números/endereços em sincronia).
 const CATALOGO_TXT = Object.values(MODELOS).map(m =>
@@ -19,6 +19,10 @@ const CATALOGO_TXT = Object.values(MODELOS).map(m =>
 const PAGAMENTO_TXT = `Cartão: ${FORMAS_PAGAMENTO.cartao}\nFinanciamento: ${FORMAS_PAGAMENTO.financiamento}\nConsórcio: ${FORMAS_PAGAMENTO.consorcio}\nÀ vista: ${FORMAS_PAGAMENTO.avista}`;
 
 const LOJAS_TXT = Object.values(LOJAS).map(l => `${l.nome} (${l.cidade}): ${l.endereco}. Maps: ${l.maps}`).join('\n');
+
+const INDICACAO_TXT = `${INDICACAO.slogan}\nComo funciona: ${INDICACAO.comoFunciona}\n` +
+    `Valores por moto comprada pelo indicado: ${Object.entries(INDICACAO.valores).map(([m, v]) => `${m} = ${v}`).join(', ')}.\n` +
+    `Regra crítica: ${INDICACAO.regraCritica}`;
 
 // -------------------------------------------------------------
 //  SYSTEM — Prompt-mestre da Avelloz Campina (estático)
@@ -80,6 +84,13 @@ Antes de passar pra equipe humana, identifique OBRIGATORIAMENTE a loja e guarde.
 Unidades:
 ${LOJAS_TXT}
 
+PEÇAS, REVISÃO E MANUTENÇÃO (assunto da OFICINA, não do comercial):
+Quando o cliente falar em peças, revisão, manutenção, garantia, conserto, barulho/defeito na moto ou assistência técnica, passe o contato direto da nossa oficina: ${OFICINA.telefone}. Fale com naturalidade, como quem já resolve: "Pra ${OFICINA.assuntos} quem te atende direitinho é a nossa oficina, no ${OFICINA.telefone}. É só chamar lá que eles te orientam." Passe o número mesmo que o cliente ainda não tenha comprado com a gente. NUNCA tente diagnosticar o defeito, cotar peça ou dar preço de revisão — isso é com a oficina. Depois de passar o número, siga a conversa com uma pergunta (se for um lead novo, retome a qualificação; se já é cliente, pergunte se ele precisa de mais alguma coisa).
+
+PROGRAMA DE INDICAÇÃO — "${INDICACAO.slogan}":
+${INDICACAO_TXT}
+Ao explicar, deixe SEMPRE claro que a indicação precisa ser passada ao vendedor ANTES de o indicado comprar: é o nome e o telefone do possível comprador, entregues a um vendedor. Se alguém perguntar se ganha a bonificação por uma compra que JÁ aconteceu sem indicação registrada antes, seja honesto e gentil: nesse caso não é possível pagar, mas ele pode indicar outras pessoas a partir de agora. Nunca prometa valor diferente dos que estão aqui e nunca invente prazo ou forma de pagamento da bonificação — se perguntarem isso, o consultor humano confirma.
+
 SITUAÇÕES ESPECÍFICAS:
 - Retomada de atendimento: "Oi, tudo bem? Tô voltando aqui pra dar continuidade no seu atendimento. Já tinha decidido o modelo da sua moto?"
 - Cliente quer dar moto usada na troca: a Avelloz NÃO trabalha com troca/aceite de moto usada. Conduza com simpatia pras formas de pagamento disponíveis.
@@ -129,6 +140,7 @@ CAMPOS PARA EXTRAIR (retorne null quando o cliente não informou):
 - querFalarComHumano: true se pedir explicitamente para falar com uma pessoa/consultor/vendedor.
 - perguntou: true se o cliente FEZ uma pergunta ou pediu uma informação (preço, modelo, condição, características) que precisa ser respondida.
 - tipoContato: "lead" se é um provável comprador novo, "cliente" se já comprou e pede pós-venda/assistência, "outros" caso contrário.
+- assunto: "pecas_revisao" se ele fala de peças, revisão, manutenção, garantia, conserto, defeito/barulho na moto ou oficina; "indicacao" se pergunta sobre indicar alguém / programa de indicação / bonificação por indicação. Senão null.
 - objecao: se houver uma objeção clara, retorne UM de: "juros_financiamento", "ta_caro", "preciso_pensar", "medo_credito", "sem_cnh", "moto_usada_troca", "test_drive", "prazo_entrega", "marca_desconhecida". Senão null.
 - correcao: lista (array) dos campos que o cliente está CORRIGINDO em relação ao que já disse (ex.: "na verdade quero a AZ125" → ["modeloInteresse"]). Use os nomes exatos dos campos acima. Retorne [] quando não houver correção.
 
@@ -185,6 +197,8 @@ ${perguntou
     ? '- O CLIENTE FEZ UMA PERGUNTA. Responda a dúvida dele de forma natural (respeitando o bloqueio de diagnóstico acima). Não empilhe perguntas do roteiro nesta resposta; mas, como sempre, termine com UMA pergunta que mantenha a conversa viva.'
     : linhaPasso}
 - Dados já coletados (NÃO pergunte de novo): ${coletados}
+${leadData.assuntoAgora === 'pecas_revisao' ? '- O cliente falou de PEÇAS/REVISÃO/MANUTENÇÃO/GARANTIA. Passe nesta mensagem o telefone da nossa oficina (' + OFICINA.telefone + ') de forma natural, sem diagnosticar defeito nem cotar peça/serviço, e termine com uma pergunta.' : ''}
+${leadData.assuntoAgora === 'indicacao' ? '- O cliente perguntou sobre INDICAÇÃO. Explique curto e certo: ele passa o nome e o telefone do possível comprador pra um vendedor ANTES da compra; se o indicado fechar, ele ganha ' + Object.entries(INDICACAO.valores).map(([m, v]) => m + ' ' + v).join(', ') + '. Se o caso dele for uma compra que já aconteceu sem indicação registrada antes, diga com gentileza que aí não é possível pagar. Termine com uma pergunta.' : ''}
 ${perfil ? '- Perfil do cliente: ' + perfil.nome + '. Abordagem/gancho da dor: ' + perfil.gancho : ''}
 ${objecaoAtiva ? '- O cliente trouxe uma objeção. Contorne com naturalidade: ' + objecaoAtiva : ''}
 ${usouNomeRecente ? '- IMPORTANTE: você JÁ chamou o cliente pelo nome nas mensagens recentes. NÃO use o nome dele nesta resposta.' : ''}

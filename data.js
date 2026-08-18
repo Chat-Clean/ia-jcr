@@ -98,6 +98,34 @@ const LOJAS = {
 };
 
 // -------------------------------------------------------------
+//  OFICINA / ASSISTÊNCIA TÉCNICA
+//  Peças, revisão, manutenção e garantia NÃO são tratados pelo comercial:
+//  a IA passa o contato direto da oficina.
+// -------------------------------------------------------------
+const OFICINA = {
+    nome: 'oficina da Avelloz Campina',
+    telefone: '(83) 98207-3221',
+    assuntos: 'peças, revisão, manutenção, garantia e assistência técnica'
+};
+
+// -------------------------------------------------------------
+//  PROGRAMA DE INDICAÇÃO — "Indicou, comprou, ganhou!"
+//  Regra confirmada pela operação (05/08/2026): a indicação precisa ser
+//  registrada com um vendedor ANTES da compra. Indicação reivindicada
+//  DEPOIS da compra fechada não é paga.
+// -------------------------------------------------------------
+const INDICACAO = {
+    slogan: 'Indicou, comprou, ganhou!',
+    comoFunciona: 'Quem indica entra em contato com um vendedor e passa o NOME e o TELEFONE do possível comprador. Se esse indicado fechar a compra, quem indicou recebe a bonificação.',
+    valores: {
+        AZ1:    'R$ 50,00',
+        AZ125:  'R$ 100,00',
+        AZX160: 'R$ 150,00'
+    },
+    regraCritica: 'A indicação só vale se for passada ao vendedor ANTES da compra. Se o cliente comprar e só depois a pessoa aparecer dizendo que indicou, infelizmente não recebe.'
+};
+
+// -------------------------------------------------------------
 //  PERFIS DE CLIENTE (o "gancho" da dor — como abordar cada caso).
 //  Usado para a IA reconhecer a realidade do lead e mostrar a conta.
 //  (No código antigo isso era "segmento"; aqui vira "perfil".)
@@ -131,8 +159,14 @@ const OBJECOES = {
 
 // -------------------------------------------------------------
 //  DEPARTAMENTOS DE TRANSFERÊNCIA
-//  O sinal enviado ao CRM é "Transferir para o departamento [nome]".
-//  A loja escolhida define o departamento (identificação OBRIGATÓRIA).
+//  A loja escolhida pelo cliente define o departamento (identificação
+//  OBRIGATÓRIA). Além da nota interna com o resumo, a IA transfere o
+//  ticket de verdade no ChatClean usando o ID do departamento
+//  (campo forceTicketToDepartment da Push API).
+//
+//  Os IDs vêm de Configurações → Departamentos no painel da Avelloz.
+//  Se algum dia forem recriados, basta sobrescrever pelo .env sem mexer
+//  no código (DEPT_ID_MATRIZ, DEPT_ID_MALVINAS, ...).
 // -------------------------------------------------------------
 const DEPARTAMENTOS = {
     matriz:   'Loja Matriz',
@@ -141,6 +175,28 @@ const DEPARTAMENTOS = {
     geral:    'Comercial',   // fallback quando a loja não foi identificada
     posvenda: 'Pós-venda'    // cliente atual pedindo suporte/pós-venda
 };
+
+// Lê um ID de departamento do .env, caindo no padrão quando não definido.
+function idEnv(nomeVar, padrao) {
+    const v = parseInt(process.env[nomeVar] || '', 10);
+    return Number.isFinite(v) ? v : padrao;
+}
+
+// ID de cada departamento no CRM (null = sem ID conhecido → não transfere,
+// só deixa a nota interna para o atendente encaminhar à mão).
+const DEPARTAMENTO_IDS = {
+    [DEPARTAMENTOS.matriz]:   idEnv('DEPT_ID_MATRIZ',    228),
+    [DEPARTAMENTOS.malvinas]: idEnv('DEPT_ID_MALVINAS',  230),
+    [DEPARTAMENTOS.monteiro]: idEnv('DEPT_ID_MONTEIRO',  231),
+    [DEPARTAMENTOS.geral]:    idEnv('DEPT_ID_COMERCIAL', null),
+    [DEPARTAMENTOS.posvenda]: idEnv('DEPT_ID_POSVENDA',  null)
+};
+
+// ID do departamento a partir do nome (null quando não cadastrado).
+function departamentoId(departamento) {
+    const id = DEPARTAMENTO_IDS[departamento];
+    return Number.isFinite(id) ? id : null;
+}
 
 // Mapeia o texto da loja escolhida pelo cliente para o departamento do CRM.
 function lojaParaDepartamento(lojaTexto) {
@@ -169,9 +225,13 @@ module.exports = {
     MODELOS,
     FORMAS_PAGAMENTO,
     LOJAS,
+    OFICINA,
+    INDICACAO,
     PERFIS,
     OBJECOES,
     DEPARTAMENTOS,
+    DEPARTAMENTO_IDS,
+    departamentoId,
     lojaParaDepartamento,
     CAMPOS_QUALIFICACAO,
     CAMPOS_SIMULACAO

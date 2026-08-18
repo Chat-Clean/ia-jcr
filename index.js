@@ -54,10 +54,14 @@ const LOOP_JANELA_MS  = parseInt(process.env.LOOP_JANELA_MIN || '3', 10) * 60 * 
 const AGRUPAR_MS     = parseInt(process.env.AGRUPAR_MENSAGENS_MS || '2000', 10);
 // Reinicia o atendimento após N horas sem interação do cliente (padrão: 24h).
 const RESET_INATIVIDADE = parseInt(process.env.RESET_INATIVIDADE_HORAS || '24', 10) * 3600 * 1000;
+// Transferência REAL do ticket para o departamento da loja escolhida (fila do
+// CRM), via forceTicketToDepartment da Push API. Defina false para voltar ao
+// comportamento antigo (só a nota interna, encaminhamento manual do atendente).
+const TRANSFERIR_DEPARTAMENTO = (process.env.TRANSFERIR_DEPARTAMENTO || 'true') !== 'false';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, lojaParaDepartamento } = require('./data');
+const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, DEPARTAMENTO_IDS, departamentoId, lojaParaDepartamento, OFICINA } = require('./data');
 const { SYSTEM_SDR, promptExtracao, promptResposta } = require('./prompts');
 const { determinarProximoCampo, aplicarCampos, detectarPerfil } = require('./flow');
 
@@ -92,11 +96,20 @@ function nucleoNumero(n) {
     return d;
 }
 
-// true se o número está na allow-list (tolerante ao 9º dígito). Lista vazia = libera todos.
+// true se o número está na allow-list. Tolerante ao 9º dígito e ao ID de
+// dispositivo do WhatsApp grudado no fim: o JID "558494610845:59" às vezes
+// chega com os dois-pontos já removidos, virando "55849461084559" — nesse caso
+// o número da lista continua sendo o começo do que veio. Lista vazia = todos.
 function contatoPermitido(numero) {
     if (!IA_ALLOWED_CONTACTS.length) return true;
     const alvo = nucleoNumero(numero);
-    return IA_ALLOWED_CONTACTS.some(a => nucleoNumero(a) === alvo);
+    return IA_ALLOWED_CONTACTS.some(a => {
+        const permitido = nucleoNumero(a);
+        if (!permitido) return false;
+        if (permitido === alvo) return true;
+        const sobra = alvo.length - permitido.length; // ID de dispositivo tem 1 ou 2 dígitos
+        return sobra > 0 && sobra <= 2 && alvo.startsWith(permitido);
+    });
 }
 
 // =============================================================
@@ -117,6 +130,33 @@ async function ccPush(number, payloadExtra = {}) {
         console.error('❌ Erro no Push ChatClean:', e.response?.data || e.message);
         return false;
     }
+}
+
+// Transfere o ticket do cliente para o DEPARTAMENTO (fila) da unidade escolhida.
+// A Push API aceita forceTicketToDepartment = ID do departamento no CRM
+// (Configurações → Departamentos): Matriz 228, Malvinas 230, Monteiro 231.
+//
+// Best-effort e SEMPRE depois da nota interna com o resumo: se o ticket já
+// estiver aceito por um atendente, o ChatClean pode mantê-lo onde está — nesse
+// caso o resumo na nota garante que a equipe encaminhe à mão sem perder contexto.
+async function transferirDepartamento(chatId, departamento) {
+    if (!TRANSFERIR_DEPARTAMENTO) return false;
+    const id = departamentoId(departamento);
+    if (!id) {
+        console.warn(`⚠️ Departamento "${departamento}" sem ID cadastrado — ticket de ${chatId} não foi transferido automaticamente.`);
+        return false;
+    }
+    const nota = `➡️ Ticket transferido automaticamente para o departamento ${departamento} (#${id}).`;
+    const ok = await ccPush(chatId, {
+        body: nota,
+        onlyNote: true,
+        note: { body: nota },
+        forceTicketToDepartment: id
+    });
+    console.log(ok
+        ? `🔀 ${chatId} → departamento ${departamento} (#${id})`
+        : `❌ Falha ao transferir ${chatId} para ${departamento} (#${id})`);
+    return ok;
 }
 
 async function enviarMensagem(chatId, texto) {
@@ -166,7 +206,8 @@ function montarResumo(leadData, chatId, opcoes = {}) {
               `  Cor/modelo: ${leadData.corModelo || 'Não informado'}\n`
             : '') +
         (opcoes.proximoExpediente ? `Retorno sugerido: ${opcoes.proximoExpediente}\n` : '') +
-        `\n➡️ Transferir para o departamento ${departamento}`;
+        `\n➡️ Transferir para o departamento ${departamento}` +
+        (departamentoId(departamento) ? ` (#${departamentoId(departamento)})` : '');
 }
 
 async function notificarEquipe(leadData, chatId, opcoes = {}) {
@@ -177,6 +218,9 @@ async function notificarEquipe(leadData, chatId, opcoes = {}) {
 
     // Nota interna no ticket do próprio cliente (fica no CRM p/ o atendente)
     await ccPush(chatId, { body: resumo, onlyNote: true, note: { body: resumo } });
+    // Transferência REAL para a fila da unidade escolhida (depois da nota, para
+    // que o contexto já esteja no ticket quando ele chegar no departamento).
+    await transferirDepartamento(chatId, departamento);
     // Resumo também por WhatsApp interno, se houver número da equipe
     if (EQUIPE_NUMERO) await ccPush(EQUIPE_NUMERO, { body: resumo });
 
@@ -333,6 +377,8 @@ async function gerarRespostaPosEncaminhamento(leadData, mensagemCliente, histori
 Responda de forma breve, calorosa e útil (registro de WhatsApp, sem markdown, no máximo 1 emoji), SEMPRE terminando com uma pergunta:
 - Se for uma dúvida simples sobre as motos/condições, responda com o que você sabe.
 - Se depender do consultor (valor de parcela, aprovação de crédito, prazo de entrega, negociação), diga que ele já vai continuar o atendimento pra resolver.
+- Se for sobre ${OFICINA.assuntos}, passe o telefone da nossa oficina: ${OFICINA.telefone}. Não diagnostique defeito nem cote peça/serviço.
+- Se for sobre INDICAÇÃO: ele passa o nome e o telefone do possível comprador pra um vendedor ANTES da compra; se o indicado fechar, ganha AZ1 R$ 50,00, AZ125 R$ 100,00, AZX160 R$ 150,00. Indicação reivindicada depois da compra fechada não é paga — diga isso com gentileza se for o caso.
 Nunca informe valor de parcela nem prometa prazo. Não refaça a qualificação e não repita o resumo.`;
         const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -573,12 +619,14 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
         // Sinais transitórios (valem só para esta resposta)
         leadData.objecaoAtiva = null;
         leadData.perguntouAgora = null;
+        leadData.assuntoAgora = null;
 
         if (extraido) {
             aplicarCampos(leadData, extraido);
             if (extraido.objecao) leadData.objecaoAtiva = extraido.objecao;
             if (extraido.perguntou) leadData.perguntouAgora = true;
             if (extraido.tipoContato) leadData.tipoContato = extraido.tipoContato;
+            if (extraido.assunto) leadData.assuntoAgora = extraido.assunto; // peças/revisão ou indicação
 
             // Detecta o PERFIL do cliente (para o gancho de dor) a partir do que
             // foi dito. Reavalia sempre que ainda não há perfil ou quando o cliente
@@ -593,10 +641,15 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 );
             }
 
-            // Cliente ATUAL pedindo pós-venda/assistência → encaminha para Pós-venda
+            // Cliente ATUAL pedindo pós-venda/assistência → encaminha para Pós-venda.
+            // Se o assunto for peças/revisão, já entrega o contato da oficina junto
+            // (é quem realmente resolve) para o cliente não ficar esperando.
             if (extraido.tipoContato === 'cliente' && !leadData.finalizado) {
                 if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
-                await enviarMensagem(chatId, 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer qual unidade você comprou (Matriz, Malvinas ou Monteiro)?');
+                const msgCliente = extraido.assunto === 'pecas_revisao'
+                    ? `Entendi! Pra ${OFICINA.assuntos} quem te atende direitinho é a nossa oficina, no ${OFICINA.telefone} 😊 Já vou avisar nosso time de pós-venda aqui também. Você comprou em qual unidade (Matriz, Malvinas ou Monteiro)?`
+                    : 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer qual unidade você comprou (Matriz, Malvinas ou Monteiro)?';
+                await enviarMensagem(chatId, msgCliente);
                 await notificarEquipe(leadData, chatId, { departamento: DEPARTAMENTOS.posvenda, tagExtra: 'CLIENTE ATUAL' });
                 leadData.finalizado = true;
                 return;
@@ -632,6 +685,7 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
 
         leadData.objecaoAtiva = null;    // consumidos
         leadData.perguntouAgora = null;
+        leadData.assuntoAgora = null;
         leadData.analiseImagem = null;
 
         await enviarMensagensQuebradas(chatId, resposta);
@@ -809,7 +863,14 @@ function parsePayload(body) {
             // WABA (WhatsApp Oficial): o número do remetente vem em message.raw.from
             // (não existe raw.Info.SenderAlt como no WhatsApp Web/whatsmeow).
             const wabaFrom = msg.raw?.from || null;
-            const numero = contato.number || contato.phone || body.number || senderAlt || wabaFrom || msg.number;
+            // O SenderAlt do whatsmeow tem PRIORIDADE: vem como JID completo
+            // ("558494610845:59@s.whatsapp.net"), então o ID do dispositivo (:59)
+            // é cortado corretamente por normalizarPhone. O contact.number do CRM
+            // às vezes já chega com esse sufixo grudado ("55849461084559"), sem os
+            // dois-pontos — e aí não há como separar o telefone do dispositivo.
+            // Em contas com LID, o SenderAlt também é quem carrega o telefone real
+            // (Chat/Sender vêm como "14079406125304@lid").
+            const numero = senderAlt || contato.number || contato.phone || body.number || wabaFrom || msg.number;
             const phone  = normalizarPhone(numero);
             if (!phone) return null;
             // contactId do CRM — usado para criar oportunidade no funil ao agendar.
@@ -990,6 +1051,7 @@ app.get('/diag', async (req, res) => {
         redis: store.isRedis(),
         pushConfigurado: !!CC_PUSH_URL,
         equipeNumero: !!EQUIPE_NUMERO,
+        transferenciaDepartamento: { ativa: TRANSFERIR_DEPARTAMENTO, ids: DEPARTAMENTO_IDS },
         pipeline: pipeline.diag()
     });
 });
@@ -1012,7 +1074,15 @@ app.get('/leads', async (req, res) => {
 // =============================================================
 //  INICIALIZAÇÃO
 // =============================================================
-app.listen(PORT, () => {
+// Falha RÁPIDO e claro se faltar a chave da OpenAI: antes era checado dentro do
+// callback do listen, ou seja, a porta abria, o healthcheck passava e só então o
+// processo morria — virando crash-loop difícil de ler no log do container.
+if (!process.env.OPENAI_API_KEY) {
+    console.error('❌ OPENAI_API_KEY não configurada — a IA não sobe. Defina a variável de ambiente e faça o deploy de novo.');
+    process.exit(1);
+}
+
+const server = app.listen(PORT, () => {
     console.log('');
     console.log('🚀 ================================');
     console.log(`🏍️  IA ${EMPRESA_INFO.nome} — VIA CHATCLEAN (Webhook + Push)`);
@@ -1025,16 +1095,42 @@ app.listen(PORT, () => {
     if (!EQUIPE_NUMERO) console.warn('ℹ️  EQUIPE_NUMERO não configurado — resumo de lead só irá como nota interna.');
     if (!ADMIN_KEY)     console.warn('🔒 ADMIN_KEY não configurada — /leads e /diag ficarão BLOQUEADOS (503). Defina para liberar o acesso administrativo.');
     if (!WEBHOOK_SECRET) console.warn('🔓 WEBHOOK_SECRET vazio — /webhook está ABERTO. Antes do go-live, defina-o e aponte a URL do ChatClean para /webhook/<secret>.');
-    if (!process.env.OPENAI_API_KEY) { console.error('❌ OPENAI_API_KEY não configurada no .env!'); process.exit(1); }
     console.log(store.isRedis()
         ? '🗄️  Estado das conversas: Redis (persistente)'
         : '🗄️  Estado das conversas: memória (defina REDIS_URL para persistir entre restarts)');
 });
 
+// Encerramento limpo: fecha o servidor HTTP (para de aceitar conexões novas e
+// deixa as em andamento terminarem) antes de sair. Se algo travar, sai mesmo
+// assim em 8s para não deixar o container pendurado.
+//
+// Se o container morre e este log NÃO aparece, o sinal não chegou ao Node — é o
+// caso de quando a plataforma inicia o app por "npm start": o npm vira PID 1,
+// recebe o SIGTERM e não repassa, e o log fica só com o
+// "npm error signal SIGTERM". Nesse cenário, configure o start command como
+// "node index.js" (é o que o Dockerfile já faz).
+let encerrando = false;
 async function shutdown(signal) {
+    if (encerrando) return;
+    encerrando = true;
     console.log(`\n⚠️  Recebido sinal ${signal}. Encerrando servidor...`);
-    process.exit(0);
+    setTimeout(() => process.exit(0), 8000).unref();
+    server.close(() => {
+        console.log('✅ Servidor encerrado.');
+        process.exit(0);
+    });
 }
+// Rede de segurança: um erro solto (promessa rejeitada sem catch, falha de
+// socket do Redis/axios) NÃO pode derrubar o atendimento inteiro. O Node encerra
+// o processo por padrão nesses casos, o que no container vira restart e 502 pra
+// quem estiver conversando. Aqui a gente loga e segue servindo.
+process.on('unhandledRejection', (motivo) => {
+    console.error('❌ Promessa rejeitada sem tratamento:', motivo?.stack || motivo);
+});
+process.on('uncaughtException', (erro) => {
+    console.error('❌ Exceção não capturada:', erro?.stack || erro);
+});
+
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGUSR2', () => shutdown('SIGUSR2'));

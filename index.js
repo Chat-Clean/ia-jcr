@@ -58,6 +58,11 @@ const RESET_INATIVIDADE = parseInt(process.env.RESET_INATIVIDADE_HORAS || '24', 
 // CRM), via forceTicketToDepartment da Push API. Defina false para voltar ao
 // comportamento antigo (só a nota interna, encaminhamento manual do atendente).
 const TRANSFERIR_DEPARTAMENTO = (process.env.TRANSFERIR_DEPARTAMENTO || 'true') !== 'false';
+// A plataforma só reposiciona ticket que está FECHADO ou é primeiro contato. Com
+// isto ligado, o push de transferência fecha o ticket junto (forceTicketToClosed),
+// que é o gatilho documentado para ele reabrir já no departamento certo. Ligue se
+// a transferência simples não mover o ticket de fila.
+const TRANSFERIR_FECHANDO = (process.env.TRANSFERIR_FECHANDO || 'false') === 'true';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -85,6 +90,10 @@ function normalizarPhone(phone) {
     // grudaria no número (…6446 + 24). Pega só a parte antes de ':' e '@'.
     return String(phone).split('@')[0].split(':')[0].replace(/\D/g, '');
 }
+
+// Frases em que a IA AFIRMA que já passou o atendimento adiante. Usado para não
+// deixar essa promessa sair quando a transferência de fato não aconteceu.
+const PROMETE_TRANSFERENCIA = /transferi|transferindo|repassando|repassei|encaminhando|encaminhei|j[áa] (vou )?(te )?pass|consultor (j[áa]|vai) (assumir|continuar|dar sequ)/i;
 
 // Pedidos INEQUÍVOCOS de transferência. De propósito não inclui "quero falar com
 // humano": essa frase aparece negada com frequência ("não quero falar com humano")
@@ -122,18 +131,24 @@ function contatoPermitido(numero) {
 //  Um único endpoint autenticado (CC_PUSH_URL) entrega as mensagens.
 //  O token JWT já vem embutido na URL como ?token=... (sem header).
 // =============================================================
+// Retorna { ok, status, data, erro } — e não só true/false — porque a
+// transferência de departamento precisa saber o que o CRM respondeu para só
+// então confirmar a transferência ao cliente.
 async function ccPush(number, payloadExtra = {}) {
-    if (!CC_PUSH_URL) { console.warn('⚠️ CC_PUSH_URL não configurado no .env — envio ignorado'); return false; }
+    if (!CC_PUSH_URL) {
+        console.warn('⚠️ CC_PUSH_URL não configurado no .env — envio ignorado');
+        return { ok: false, erro: 'CC_PUSH_URL ausente' };
+    }
     try {
-        await axios.post(CC_PUSH_URL, {
+        const resp = await axios.post(CC_PUSH_URL, {
             number: normalizarPhone(number),
             externalKey: crypto.randomUUID(),
             ...payloadExtra
         }, { headers: { 'Content-Type': 'application/json' }, timeout: 30000 });
-        return true;
+        return { ok: true, status: resp.status, data: resp.data };
     } catch (e) {
         console.error('❌ Erro no Push ChatClean:', e.response?.data || e.message);
-        return false;
+        return { ok: false, status: e.response?.status, data: e.response?.data, erro: e.message };
     }
 }
 
@@ -141,32 +156,46 @@ async function ccPush(number, payloadExtra = {}) {
 // A Push API aceita forceTicketToDepartment = ID do departamento no CRM
 // (Configurações → Departamentos): Matriz 228, Malvinas 230, Monteiro 231.
 //
-// Best-effort e SEMPRE depois da nota interna com o resumo: se o ticket já
-// estiver aceito por um atendente, o ChatClean pode mantê-lo onde está — nesse
-// caso o resumo na nota garante que a equipe encaminhe à mão sem perder contexto.
+// Retorna { ok, id, departamento, motivo, resposta }. O ok é o que autoriza a IA
+// a CONFIRMAR a transferência para o cliente — sem ele, prometer "já te
+// transferi" seria mentira e o cliente ficaria esperando na fila errada.
+//
+// A doc da plataforma diz que o ticket só é reposicionado quando está fechado ou
+// é o primeiro contato. Quando TRANSFERIR_FECHANDO=true a gente fecha o ticket no
+// mesmo push (forceTicketToClosed), que é o gatilho para ele reabrir já na fila
+// do departamento certo.
 async function transferirDepartamento(chatId, departamento) {
-    if (!TRANSFERIR_DEPARTAMENTO) return false;
+    if (!TRANSFERIR_DEPARTAMENTO) {
+        return { ok: false, departamento, motivo: 'transferência automática desligada (TRANSFERIR_DEPARTAMENTO=false)' };
+    }
     const id = departamentoId(departamento);
     if (!id) {
-        console.warn(`⚠️ Departamento "${departamento}" sem ID cadastrado — ticket de ${chatId} não foi transferido automaticamente.`);
-        return false;
+        console.warn(`⚠️ Departamento "${departamento}" sem ID cadastrado — ticket de ${chatId} não foi transferido.`);
+        return { ok: false, departamento, motivo: `departamento "${departamento}" sem ID cadastrado` };
     }
     const nota = `➡️ Ticket transferido automaticamente para o departamento ${departamento} (#${id}).`;
-    const ok = await ccPush(chatId, {
+    const payload = {
         body: nota,
         onlyNote: true,
         note: { body: nota },
         forceTicketToDepartment: id
-    });
-    console.log(ok
-        ? `🔀 ${chatId} → departamento ${departamento} (#${id})`
-        : `❌ Falha ao transferir ${chatId} para ${departamento} (#${id})`);
-    return ok;
+    };
+    if (TRANSFERIR_FECHANDO) payload.forceTicketToClosed = true;
+
+    const r = await ccPush(chatId, payload);
+    // Log da resposta CRUA do CRM: é o que permite descobrir por que um ticket
+    // não mudou de fila sem precisar reproduzir a conversa inteira.
+    console.log(`🔀 transferência ${chatId} → ${departamento} (#${id}): ${r.ok ? 'aceita' : 'RECUSADA'} | status ${r.status || '-'} | resposta: ${JSON.stringify(r.data || r.erro || null).slice(0, 400)}`);
+    return {
+        ok: r.ok, id, departamento,
+        motivo: r.ok ? null : (r.erro || 'o CRM recusou o push de transferência'),
+        resposta: r.data
+    };
 }
 
 async function enviarMensagem(chatId, texto) {
     if (!texto || !String(texto).trim()) return false;
-    return ccPush(chatId, { body: texto });
+    return (await ccPush(chatId, { body: texto })).ok;
 }
 
 // Quebra a resposta em mensagens curtas (registro de WhatsApp), a menos que
@@ -225,9 +254,14 @@ async function notificarEquipe(leadData, chatId, opcoes = {}) {
     await ccPush(chatId, { body: resumo, onlyNote: true, note: { body: resumo } });
     // Transferência REAL para a fila da unidade escolhida (depois da nota, para
     // que o contexto já esteja no ticket quando ele chegar no departamento).
-    await transferirDepartamento(chatId, departamento);
-    // Resumo também por WhatsApp interno, se houver número da equipe
-    if (EQUIPE_NUMERO) await ccPush(EQUIPE_NUMERO, { body: resumo });
+    const transferencia = await transferirDepartamento(chatId, departamento);
+    // Resumo também por WhatsApp interno, se houver número da equipe. Quando a
+    // transferência falha, a equipe precisa saber para encaminhar na mão.
+    if (EQUIPE_NUMERO) {
+        const aviso = transferencia.ok ? '' :
+            `\n\n⚠️ ATENÇÃO: a transferência automática para ${departamento} NÃO foi concluída (${transferencia.motivo}). Encaminhe este ticket manualmente.`;
+        await ccPush(EQUIPE_NUMERO, { body: resumo + aviso });
+    }
 
     // Histórico append-only de leads qualificados
     try {
@@ -240,8 +274,8 @@ async function notificarEquipe(leadData, chatId, opcoes = {}) {
         });
     } catch (e) { console.error('❌ appendLeadFinalizado:', e.message); }
 
-    console.log(`✅ Equipe notificada — lead ${leadData.nome || ''} (${chatId}) → ${departamento}`);
-    return true;
+    console.log(`✅ Equipe notificada — lead ${leadData.nome || ''} (${chatId}) → ${departamento}${transferencia.ok ? '' : ' (SEM transferência automática)'}`);
+    return transferencia;
 }
 
 // A state machine (determinarProximoCampo / aplicarCampos / detectarPerfil)
@@ -404,21 +438,40 @@ Nunca informe valor de parcela nem prometa prazo. Não refaça a qualificação 
 // =============================================================
 //  ENCAMINHAMENTO PARA HUMANO
 // =============================================================
+// A ORDEM aqui é a regra de negócio: transfere PRIMEIRO, confirma DEPOIS. A IA só
+// diz "já te passei pro consultor" quando o ticket realmente entrou na fila do
+// departamento. Se a transferência falhar, ela responde sem prometer a passagem
+// e a equipe recebe o alerta para encaminhar na mão.
 async function encaminhar(chatId, leadData, departamento, mensagemCliente, historico, expediente = null) {
     const exp = expediente || estaEmExpediente();
-    // Deixa a IA escrever o handoff de forma calorosa (usa o branch de qualificação completa)
     leadData.qualificacaoCompleta = true;
+
+    const transferencia = await notificarEquipe(leadData, chatId, {
+        departamento,
+        tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE',
+        proximoExpediente: exp.aberto ? null : exp.proximoExpediente
+    });
+
     let msg;
-    try {
-        msg = await gerarRespostaIA(leadData, mensagemCliente, null, historico, exp);
-    } catch (_) {
+    if (transferencia.ok) {
+        // Deixa a IA escrever o handoff de forma calorosa (branch de qualificação completa)
+        try {
+            msg = await gerarRespostaIA(leadData, mensagemCliente, null, historico, exp);
+        } catch (_) {
+            msg = exp.aberto
+                ? 'Perfeito! Já tô repassando tudo pro nosso consultor. Ele assume seu atendimento aqui rapidinho, combinado?'
+                : `Perfeito, deixei tudo registrado! Nosso consultor te retorna ${exp.proximoExpediente}. Enquanto isso, ficou alguma dúvida sobre a moto?`;
+        }
+    } else {
+        // Sem transferência confirmada: NÃO prometa que já passou pro consultor.
+        console.warn(`⚠️ ${chatId}: confirmação de transferência suprimida — ${transferencia.motivo}`);
         msg = exp.aberto
-            ? 'Perfeito! Já tô repassando tudo pro nosso consultor. Ele assume seu atendimento aqui rapidinho, combinado? 😊'
-            : `Perfeito, deixei tudo registrado! Nosso consultor te retorna ${exp.proximoExpediente}. Enquanto isso, ficou alguma dúvida sobre a moto? 😊`;
+            ? 'Perfeito, anotei tudo aqui! Nosso consultor já vai dar sequência no seu atendimento por aqui mesmo. Enquanto isso, ficou alguma dúvida sobre a moto?'
+            : `Perfeito, deixei tudo registrado! Nosso consultor dá sequência ${exp.proximoExpediente}. Enquanto isso, ficou alguma dúvida sobre a moto?`;
     }
     await enviarMensagem(chatId, msg);
     leadData.conversationHistory.push({ role: 'assistant', content: msg });
-    await notificarEquipe(leadData, chatId, { departamento, tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE', proximoExpediente: exp.aberto ? null : exp.proximoExpediente });
+    leadData.transferidoOk = transferencia.ok;
     leadData.finalizado = true;
     leadData.followUpDueAt = null;
 }
@@ -712,6 +765,29 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
         const modeloNaResposta = detectarModeloMencionado(resposta);
         if (modeloNaResposta) leadData.modeloApresentado = modeloNaResposta;
 
+        // Qualificação completa → TRANSFERE primeiro, responde depois. A ordem é
+        // deliberada: a IA só pode confirmar a passagem para o cliente depois que
+        // o ticket realmente entrou na fila do departamento da loja escolhida.
+        let transferencia = null;
+        if (leadData.qualificacaoCompleta && !leadData.finalizado) {
+            transferencia = await notificarEquipe(leadData, chatId, {
+                departamento: departamentoLead(leadData),
+                tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE — AGENDAR RETORNO',
+                proximoExpediente: exp.aberto ? null : exp.proximoExpediente
+            });
+            leadData.transferidoOk = transferencia.ok;
+            leadData.finalizado = true;
+        }
+
+        // A transferência não foi concluída, mas a IA escreveu que já repassou:
+        // troca por uma mensagem que não promete o que não aconteceu.
+        if (transferencia && !transferencia.ok && PROMETE_TRANSFERENCIA.test(resposta)) {
+            console.warn(`⚠️ ${chatId}: resposta prometia transferência que não ocorreu (${transferencia.motivo}) — texto substituído.`);
+            resposta = exp.aberto
+                ? 'Perfeito, anotei tudo aqui! Nosso consultor já vai dar sequência no seu atendimento por aqui mesmo. Ficou alguma dúvida sobre a moto?'
+                : `Perfeito, deixei tudo registrado! Nosso consultor dá sequência ${exp.proximoExpediente}. Ficou alguma dúvida sobre a moto?`;
+        }
+
         await enviarMensagensQuebradas(chatId, resposta);
         if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
         leadData.conversationHistory.push({ role: 'assistant', content: resposta });
@@ -719,17 +795,7 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
             leadData.conversationHistory = leadData.conversationHistory.slice(-100);
         }
 
-        // Qualificação completa → notifica a equipe (transbordo p/ a loja) e encerra.
-        if (leadData.qualificacaoCompleta && !leadData.finalizado) {
-            await notificarEquipe(leadData, chatId, {
-                departamento: departamentoLead(leadData),
-                tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE — AGENDAR RETORNO',
-                proximoExpediente: exp.aberto ? null : exp.proximoExpediente
-            });
-            leadData.finalizado = true;
-        } else if (!leadData.finalizado) {
-            agendarFollowUpReativacao(leadData);
-        }
+        if (!leadData.finalizado) agendarFollowUpReativacao(leadData);
 
     } catch (e) {
         console.error(`❌ Erro ao processar mensagem de ${chatId}:`, e);
@@ -1075,8 +1141,30 @@ app.get('/diag', async (req, res) => {
         redis: store.isRedis(),
         pushConfigurado: !!CC_PUSH_URL,
         equipeNumero: !!EQUIPE_NUMERO,
-        transferenciaDepartamento: { ativa: TRANSFERIR_DEPARTAMENTO, ids: DEPARTAMENTO_IDS },
+        transferenciaDepartamento: { ativa: TRANSFERIR_DEPARTAMENTO, fechandoTicket: TRANSFERIR_FECHANDO, ids: DEPARTAMENTO_IDS },
         pipeline: pipeline.diag()
+    });
+});
+
+// Testa a transferência de um ticket SEM precisar refazer a conversa inteira.
+// Ex.: /diag/transferir?key=ADMIN&numero=5583999999999&loja=malvinas
+// Retorna a resposta CRUA do CRM — é assim que se descobre por que um ticket não
+// muda de fila. Não manda nada para o cliente (a nota é interna).
+app.get('/diag/transferir', async (req, res) => {
+    if (!checarAdmin(req, res)) return;
+    const numero = String(req.query.numero || '').trim();
+    const loja   = String(req.query.loja || '').trim();
+    if (!numero) return res.status(400).json({ erro: 'informe ?numero=55DDNNNNNNNNN' });
+
+    const departamento = lojaParaDepartamento(loja) || DEPARTAMENTOS[loja] || loja || DEPARTAMENTOS.geral;
+    const r = await transferirDepartamento(normalizarPhone(numero), departamento);
+    res.json({
+        numeroEnviado: normalizarPhone(numero),
+        departamento, idUsado: r.id || departamentoId(departamento),
+        fechandoTicket: TRANSFERIR_FECHANDO,
+        transferiu: r.ok,
+        motivo: r.motivo,
+        respostaDoCRM: r.resposta
     });
 });
 
@@ -1106,7 +1194,9 @@ if (!process.env.OPENAI_API_KEY) {
     process.exit(1);
 }
 
+let servidorPronto = false;
 const server = app.listen(PORT, () => {
+    servidorPronto = true;
     console.log('');
     console.log('🚀 ================================');
     console.log(`🏍️  IA ${EMPRESA_INFO.nome} — VIA CHATCLEAN (Webhook + Push)`);
@@ -1134,6 +1224,13 @@ const server = app.listen(PORT, () => {
 // "npm error signal SIGTERM". Nesse cenário, configure o start command como
 // "node index.js" (é o que o Dockerfile já faz).
 let encerrando = false;
+// Falha ao subir (porta ocupada, permissão) é FATAL: precisa sair com código
+// de erro para a plataforma tratar como falha, não como parada limpa.
+server.on('error', (e) => {
+    console.error('❌ Não foi possível subir o servidor:', e.message);
+    process.exit(1);
+});
+
 async function shutdown(signal) {
     if (encerrando) return;
     encerrando = true;
@@ -1153,6 +1250,9 @@ process.on('unhandledRejection', (motivo) => {
 });
 process.on('uncaughtException', (erro) => {
     console.error('❌ Exceção não capturada:', erro?.stack || erro);
+    // Antes de o servidor estar no ar, qualquer exceção é falha de
+    // inicialização: sair com 0 faria um erro fatal parecer parada normal.
+    if (!servidorPronto) process.exit(1);
 });
 
 process.on('SIGINT',  () => shutdown('SIGINT'));

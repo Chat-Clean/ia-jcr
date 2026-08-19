@@ -172,8 +172,13 @@ const DEPARTAMENTOS = {
     matriz:   'Loja Matriz',
     malvinas: 'Loja Malvinas',
     monteiro: 'Loja Monteiro',
-    geral:    'Comercial',   // fallback quando a loja não foi identificada
-    posvenda: 'Pós-venda'    // cliente atual pedindo suporte/pós-venda
+    // Porta de entrada: é ONDE O LEAD JÁ ESTÁ enquanto a IA atende. Não é
+    // destino de transferência — quando a loja não é identificada, o ticket
+    // simplesmente permanece aqui para a equipe tratar.
+    entrada:  'Agente IA',
+    // Só existe se a operação criar um departamento próprio de pós-venda.
+    // Sem ID cadastrado, o cliente atual é encaminhado para a unidade dele.
+    posvenda: 'Pós-venda'
 };
 
 // Lê um ID de departamento do .env, caindo no padrão quando não definido.
@@ -188,7 +193,7 @@ const DEPARTAMENTO_IDS = {
     [DEPARTAMENTOS.matriz]:   idEnv('DEPT_ID_MATRIZ',    228),
     [DEPARTAMENTOS.malvinas]: idEnv('DEPT_ID_MALVINAS',  230),
     [DEPARTAMENTOS.monteiro]: idEnv('DEPT_ID_MONTEIRO',  231),
-    [DEPARTAMENTOS.geral]:    idEnv('DEPT_ID_COMERCIAL', null),
+    [DEPARTAMENTOS.entrada]:  idEnv('DEPT_ID_AGENTE_IA', null),
     [DEPARTAMENTOS.posvenda]: idEnv('DEPT_ID_POSVENDA',  null)
 };
 

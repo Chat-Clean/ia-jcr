@@ -75,7 +75,17 @@ A loja que o **cliente escolhe** define o departamento de destino. Ao qualificar
 
 Os IDs vêm de **Configurações → Departamentos** no painel e ficam em `data.js`; se forem recriados, sobrescreva pelo `.env` (`DEPT_ID_MATRIZ`, `DEPT_ID_MALVINAS`, `DEPT_ID_MONTEIRO`). Comercial e Pós-venda ainda **não têm ID** — preencha `DEPT_ID_COMERCIAL` / `DEPT_ID_POSVENDA` para que também sejam transferidos automaticamente; sem ID, a IA só deixa a nota interna e o atendente encaminha à mão. `TRANSFERIR_DEPARTAMENTO=false` desliga a transferência automática e volta ao comportamento antigo.
 
-> Conferir no go-live: a documentação da plataforma indica que o roteirizador só reposiciona o ticket quando ele está **fechado ou é o primeiro contato**. Se o ticket já estiver em *pendentes/ativos*, o CRM pode mantê-lo onde está — nesse caso a nota interna com o resumo continua garantindo o contexto para o encaminhamento manual. `GET /diag` mostra `transferenciaDepartamento` com os IDs em uso.
+A IA **só confirma a transferência ao cliente depois que ela acontece**. A ordem em cada fechamento é: grava a nota interna, tenta transferir, e só então responde. Se o CRM recusar a transferência, a IA responde sem prometer o repasse e a equipe recebe o resumo com um alerta para encaminhar à mão.
+
+**Se o ticket não muda de fila:** a plataforma só reposiciona ticket que está *fechado* ou é *primeiro contato* — um ticket já em atendimento tende a ficar onde está. Nesse caso ligue `TRANSFERIR_FECHANDO=true`, que fecha o ticket no mesmo push (`forceTicketToClosed`), o gatilho documentado para ele reabrir já no departamento certo.
+
+**Para diagnosticar sem refazer a conversa**, use o endpoint administrativo, que devolve a resposta crua do CRM:
+
+```
+GET /diag/transferir?key=ADMIN_KEY&numero=5583999999999&loja=malvinas
+```
+
+Ele responde `transferiu`, `idUsado`, `motivo` e `respostaDoCRM`. Não envia nada ao cliente — a nota é interna. `GET /diag` mostra a configuração ativa em `transferenciaDepartamento`.
 
 ## Rodar local
 

@@ -67,13 +67,14 @@ A loja que o **cliente escolhe** define o departamento de destino. Ao qualificar
 
 | Departamento | ID | Quando |
 |---|---|---|
+| Agente IA | — | porta de entrada: onde o lead nasce e fica enquanto a IA atende |
 | Loja Matriz | 228 | cliente escolheu a Matriz (ou citou Centro / João Suassuna) |
 | Loja Malvinas | 230 | cliente escolheu Malvinas |
 | Loja Monteiro | 231 | cliente escolheu Monteiro |
-| Comercial | — | loja não identificada (fallback) |
-| Pós-venda | — | cliente atual pedindo assistência |
 
-Os IDs vêm de **Configurações → Departamentos** no painel e ficam em `data.js`; se forem recriados, sobrescreva pelo `.env` (`DEPT_ID_MATRIZ`, `DEPT_ID_MALVINAS`, `DEPT_ID_MONTEIRO`). Comercial e Pós-venda ainda **não têm ID** — preencha `DEPT_ID_COMERCIAL` / `DEPT_ID_POSVENDA` para que também sejam transferidos automaticamente; sem ID, a IA só deixa a nota interna e o atendente encaminha à mão. `TRANSFERIR_DEPARTAMENTO=false` desliga a transferência automática e volta ao comportamento antigo.
+Se o cliente não chegar a escolher uma unidade, **não há transferência**: o ticket permanece no Agente IA, com a nota do resumo, para a equipe direcionar. Isso é fluxo normal, não falha — a equipe só é alertada quando a transferência era esperada e o CRM a recusou. Cliente antigo pedindo pós-venda é encaminhado para a unidade onde comprou; se a operação criar um departamento próprio de pós-venda, basta preencher `DEPT_ID_POSVENDA`.
+
+Os IDs vêm de **Configurações → Departamentos** no painel e ficam em `data.js`; se forem recriados, sobrescreva pelo `.env` (`DEPT_ID_MATRIZ`, `DEPT_ID_MALVINAS`, `DEPT_ID_MONTEIRO`). `TRANSFERIR_DEPARTAMENTO=false` desliga a transferência automática e volta ao comportamento antigo, em que o atendente encaminha à mão a partir da nota interna.
 
 A IA **só confirma a transferência ao cliente depois que ela acontece**. A ordem em cada fechamento é: grava a nota interna, tenta transferir, e só então responde. Se o CRM recusar a transferência, a IA responde sem prometer o repasse e a equipe recebe o resumo com um alerta para encaminhar à mão.
 

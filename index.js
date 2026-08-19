@@ -71,9 +71,16 @@ const { SYSTEM_SDR, promptExtracao, promptResposta } = require('./prompts');
 const { determinarProximoCampo, aplicarCampos, detectarPerfil, detectarModeloMencionado } = require('./flow');
 
 // Departamento de transbordo do lead = a loja que ele escolheu (obrigatória
-// no fluxo). Sem loja identificada, cai no Comercial geral.
+// no fluxo). Sem loja identificada, permanece no Agente IA (a porta de entrada).
 function departamentoLead(leadData) {
-    return lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.geral;
+    return lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.entrada;
+}
+// Pós-venda: a operação não tem um departamento próprio para isso. O cliente
+// atual vai para a UNIDADE onde comprou; se ainda não sabemos qual é, o ticket
+// permanece no Agente IA até a equipe direcionar.
+function departamentoPosVenda(leadData) {
+    if (departamentoId(DEPARTAMENTOS.posvenda)) return DEPARTAMENTOS.posvenda;
+    return lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.entrada;
 }
 const { estaEmExpediente } = require('./horario');
 const pipeline = require('./pipeline'); // Oportunidades no CRM (inerte se não configurado)
@@ -168,6 +175,12 @@ async function transferirDepartamento(chatId, departamento) {
     if (!TRANSFERIR_DEPARTAMENTO) {
         return { ok: false, departamento, motivo: 'transferência automática desligada (TRANSFERIR_DEPARTAMENTO=false)' };
     }
+    // O lead JÁ está no Agente IA: não há para onde transferir enquanto a loja
+    // não for escolhida. Isso é fluxo normal, não erro de configuração.
+    if (departamento === DEPARTAMENTOS.entrada && !departamentoId(departamento)) {
+        console.log(`ℹ️ ${chatId}: sem loja definida — ticket permanece em ${DEPARTAMENTOS.entrada}.`);
+        return { ok: false, departamento, permanece: true, motivo: `sem loja escolhida — permanece em ${DEPARTAMENTOS.entrada}` };
+    }
     const id = departamentoId(departamento);
     if (!id) {
         console.warn(`⚠️ Departamento "${departamento}" sem ID cadastrado — ticket de ${chatId} não foi transferido.`);
@@ -240,8 +253,9 @@ function montarResumo(leadData, chatId, opcoes = {}) {
               `  Cor/modelo: ${leadData.corModelo || 'Não informado'}\n`
             : '') +
         (opcoes.proximoExpediente ? `Retorno sugerido: ${opcoes.proximoExpediente}\n` : '') +
-        `\n➡️ Transferir para o departamento ${departamento}` +
-        (departamentoId(departamento) ? ` (#${departamentoId(departamento)})` : '');
+        (departamentoId(departamento)
+            ? `\n➡️ Transferir para o departamento ${departamento} (#${departamentoId(departamento)})`
+            : `\n➡️ Sem loja escolhida — o ticket permanece em ${departamento} para a equipe direcionar`);
 }
 
 async function notificarEquipe(leadData, chatId, opcoes = {}) {
@@ -258,7 +272,7 @@ async function notificarEquipe(leadData, chatId, opcoes = {}) {
     // Resumo também por WhatsApp interno, se houver número da equipe. Quando a
     // transferência falha, a equipe precisa saber para encaminhar na mão.
     if (EQUIPE_NUMERO) {
-        const aviso = transferencia.ok ? '' :
+        const aviso = (transferencia.ok || transferencia.permanece) ? '' :
             `\n\n⚠️ ATENÇÃO: a transferência automática para ${departamento} NÃO foi concluída (${transferencia.motivo}). Encaminhe este ticket manualmente.`;
         await ccPush(EQUIPE_NUMERO, { body: resumo + aviso });
     }
@@ -708,7 +722,7 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                     ? `Entendi! Pra ${OFICINA.assuntos} quem te atende direitinho é a nossa oficina, no ${OFICINA.telefone} 😊 Já vou avisar nosso time de pós-venda aqui também. Você comprou em qual unidade (Matriz, Malvinas ou Monteiro)?`
                     : 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer qual unidade você comprou (Matriz, Malvinas ou Monteiro)?';
                 await enviarMensagem(chatId, msgCliente);
-                await notificarEquipe(leadData, chatId, { departamento: DEPARTAMENTOS.posvenda, tagExtra: 'CLIENTE ATUAL' });
+                await notificarEquipe(leadData, chatId, { departamento: departamentoPosVenda(leadData), tagExtra: 'CLIENTE ATUAL' });
                 leadData.finalizado = true;
                 return;
             }
@@ -1156,7 +1170,7 @@ app.get('/diag/transferir', async (req, res) => {
     const loja   = String(req.query.loja || '').trim();
     if (!numero) return res.status(400).json({ erro: 'informe ?numero=55DDNNNNNNNNN' });
 
-    const departamento = lojaParaDepartamento(loja) || DEPARTAMENTOS[loja] || loja || DEPARTAMENTOS.geral;
+    const departamento = lojaParaDepartamento(loja) || DEPARTAMENTOS[loja] || loja || DEPARTAMENTOS.entrada;
     const r = await transferirDepartamento(normalizarPhone(numero), departamento);
     res.json({
         numeroEnviado: normalizarPhone(numero),

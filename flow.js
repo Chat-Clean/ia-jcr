@@ -29,6 +29,16 @@ function detectarModeloMencionado(texto) {
 }
 
 function determinarProximoCampo(leadData) {
+    // ATALHO: o cliente disse que tem pressa / quer ir direto ao assunto. O funil
+    // inteiro é abandonado e só a LOJA importa, porque é o único campo obrigatório
+    // para transferir de verdade (sem ela o ticket não sai da fila do Agente IA).
+    // Ligado em index.js quando querAvancar / PEDE_AGILIDADE dispara.
+    if (leadData.modoAtalho) {
+        if (!leadData.loja) return { campo: 'loja', pergunta: 'O cliente pediu OBJETIVIDADE. NÃO faça diagnóstico, NÃO pergunte gasto, transporte ou forma de pagamento e NÃO ofereça modelo. Pergunte SÓ em qual unidade ele quer ser atendido, citando as três (Matriz, Malvinas e Monteiro). Uma frase curta, nada mais.' };
+        leadData.qualificacaoCompleta = true;
+        return null;
+    }
+
     // A IA já recomendou uma moto e o cliente SEGUIU ADIANTE (falou de pagamento,
     // escolheu loja ou passou dados) sem dizer "quero essa" com todas as letras.
     // Sem isto o fluxo fica preso em modeloInteresse: a cada mensagem a instrução
@@ -44,9 +54,12 @@ function determinarProximoCampo(leadData) {
             leadData.modeloInteresse = leadData.modeloApresentado;
         }
     }
-    if (!leadData.finalidade)      return { campo: 'finalidade',      pergunta: 'Pergunte pra que ele quer a moto (trabalhar, economizar, passear, pra esposa) e se já viu algum modelo nosso (passo 2 — interesse).' };
-    if (!leadData.transporteAtual) return { campo: 'transporteAtual', pergunta: 'Pergunte como ele se locomove HOJE: carro, Uber, ônibus, carona ou moto alugada (passo 3 — diagnóstico). Uma coisa de cada vez.' };
-    if (!leadData.gastoMensal)     return { campo: 'gastoMensal',     pergunta: 'Pergunte quanto ele gasta por mês nesse transporte (faça ele dizer o número em reais) e o quanto de tempo perde esperando/no trânsito.' };
+    // UMA pergunta por vez, sempre. Perguntas duplas ("quanto gasta E quanto tempo
+    // perde?") fazem o cliente responder só a segunda parte: o campo continua vazio,
+    // a IA repete a pergunta e ele se irrita — foi o que travou o atendimento no print.
+    if (!leadData.finalidade)      return { campo: 'finalidade',      pergunta: 'Pergunte APENAS pra que ele quer a moto (trabalhar, economizar, passear, pra esposa) — passo 2, interesse. Não emende nenhuma outra pergunta na mesma mensagem.' };
+    if (!leadData.transporteAtual) return { campo: 'transporteAtual', pergunta: 'Pergunte APENAS como ele se locomove HOJE: carro, Uber, ônibus, carona ou moto alugada (passo 3 — diagnóstico). Uma coisa de cada vez.' };
+    if (!leadData.gastoMensal)     return { campo: 'gastoMensal',     pergunta: 'Pergunte APENAS quanto ele gasta por mês nesse transporte, fazendo ele dizer o número em reais. NÃO pergunte junto sobre tempo perdido no trânsito nem qualquer outra coisa — só o valor.' };
     if (!leadData.situacaoMoto)    return { campo: 'situacaoMoto',    pergunta: 'Descubra se ele já tem moto e a situação (própria, alugada, velha, manutenção cara). Se roda de app, pergunte quanto paga de aluguel por semana/mês.' };
     if (!leadData.modeloInteresse) return { campo: 'modeloInteresse', pergunta: leadData.modeloApresentado
         ? `Você JÁ recomendou a ${leadData.modeloApresentado} e JÁ mostrou a conta do gasto anual. NÃO recomende outro modelo, NÃO repita o preço e NÃO refaça o cálculo: apenas confirme, numa pergunta curta, se é essa mesma que ele quer levar.`

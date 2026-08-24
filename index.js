@@ -183,8 +183,9 @@ async function ccPush(number, payloadExtra = {}) {
 }
 
 // Transfere o ticket do cliente para o DEPARTAMENTO (fila) da unidade escolhida.
-// A Push API aceita forceTicketToDepartment = ID do departamento no CRM
-// (Configurações → Departamentos): Matriz 228, Malvinas 230, Monteiro 231.
+// A Push API espera DOIS campos: forceTicketToDepartment = true (interruptor) e
+// queueId = ID do departamento no CRM (Configurações → Departamentos):
+// Matriz 228, Malvinas 230, Monteiro 231.
 //
 // Retorna { ok, id, departamento, motivo, resposta }. O ok é o que autoriza a IA
 // a CONFIRMAR a transferência para o cliente — sem ele, prometer "já te
@@ -214,7 +215,17 @@ async function transferirDepartamento(chatId, departamento) {
         body: nota,
         onlyNote: true,
         note: { body: nota },
-        forceTicketToDepartment: id
+        // A Push API usa forceTicketToDepartment como INTERRUPTOR (booleano), no
+        // mesmo padrão de forceTicketToClosed, e lê o ID do departamento em
+        // queueId — "queue" é como a plataforma chama departamento internamente.
+        //
+        // Mandar o ID direto em forceTicketToDepartment (como era antes) não dá
+        // erro: a API responde 200 com corpo VAZIO e descarta o campo em silêncio.
+        // A nota interna era gravada normalmente, o log dizia "aceita", a IA
+        // confirmava a transferência para o cliente — e o ticket nunca saía da
+        // fila de origem. Confirmado em teste direto contra a API.
+        forceTicketToDepartment: true,
+        queueId: id
     };
     if (TRANSFERIR_FECHANDO) payload.forceTicketToClosed = true;
 

@@ -62,7 +62,7 @@ Acolher (conhece a marca?) → interesse (pra que quer a moto) → **diagnóstic
 A loja que o **cliente escolhe** define o departamento de destino. Ao qualificar o lead, a IA faz três coisas no ticket, nesta ordem:
 
 1. grava a **nota interna** com o resumo completo do lead;
-2. **transfere o ticket** para a fila da unidade, via `forceTicketToDepartment` da Push API;
+2. **transfere o ticket** para a fila da unidade, via `forceTicketToDepartment: true` + `queueId: <ID>` da Push API;
 3. manda o resumo pro WhatsApp interno (se `EQUIPE_NUMERO` estiver definido).
 
 | Departamento | ID | Quando |

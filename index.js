@@ -48,6 +48,10 @@ const RATE_LIMIT_JANELA = parseInt(process.env.RATE_LIMIT_JANELA_S || '60', 10) 
 // ping-pong infinito com outro bot.
 const LOOP_MAX_TURNOS = parseInt(process.env.LOOP_MAX_TURNOS || '15', 10);
 const LOOP_JANELA_MS  = parseInt(process.env.LOOP_JANELA_MIN || '3', 10) * 60 * 1000;
+// Teto de respostas da IA DEPOIS que o lead já foi transferido. Passando disso ela
+// se despede e cala: quem conduz o atendimento a partir da transferência é o
+// consultor humano, e a IA respondendo em paralelo atropela o trabalho dele.
+const MAX_RESPOSTAS_POS_HANDOFF = parseInt(process.env.MAX_RESPOSTAS_POS_HANDOFF || '3', 10);
 // Janela (ms) para AGRUPAR mensagens rápidas do mesmo cliente antes de responder.
 // No WhatsApp o cliente costuma mandar várias mensagens seguidas; juntamos tudo
 // num único turno em vez de responder só a primeira e ignorar o resto.
@@ -106,6 +110,18 @@ const PROMETE_TRANSFERENCIA = /transferi|transferindo|repassando|repassei|encami
 // humano": essa frase aparece negada com frequência ("não quero falar com humano")
 // e o julgamento de intenção nesse caso fica com a IA, na extração.
 const PEDE_TRANSFERENCIA = /\b(me\s+transfir\w*|pode(m)?\s+transferir|quero\s+ser\s+transferid\w*|me\s+passa\s+(pro|para\s+o?)\s*(vendedor|consultor|atendente)|chama\s+(um\s+)?(vendedor|consultor|atendente))\b/i;
+
+// IMPACIÊNCIA: o cliente não pediu ninguém, mas quer que o atendimento ANDE.
+// Rede de segurança do campo querAvancar da extração — o modelo costuma tratar
+// essas frases como conversa normal e devolver false, deixando o funil rodar e
+// irritando ainda mais quem já disse que tem pressa.
+const PEDE_AGILIDADE = /(diret[oa]s?\s+(ao|pro|para\s+o)\s+(assunto|ponto)|ir\s+ao\s+ponto|sem\s+(enrola|rodeio)|para\s+de\s+perguntar|muita(s)?\s+pergunta|quantas\s+perguntas|pouco\s+tempo|sem\s+tempo|t[ôo]\s+com\s+pressa|com\s+pressa|(quanto\s+custa|qual\s+o\s+pre[çc]o|me\s+manda\s+o\s+pre[çc]o).{0,15}(logo|agora|direto)|vamos?\s+(logo|direto)|resolver\s+r[áa]pido)/i;
+
+// Sinais de ENCERRAMENTO: o cliente não tem mais nada a tratar e só vai aguardar
+// o consultor. Rede de segurança do campo encerrouConversa. Ancorado no início da
+// mensagem e limitado no tamanho para não confundir "não" de uma frase longa
+// ("não entendi o preço") com um encerramento de verdade.
+const SINAL_ENCERRAMENTO = /^\s*(n[ãa]o|nada|nop|s[óo]\s+(esperar|aguardar)|vou\s+(esperar|aguardar)|ok(ay)?|blz|beleza|t[áa]\s+(bom|certo|ok)|certo|obrigad\w*|obg|vlw|valeu|show|perfeito|isso|[éeE]\s+isso|combinado|fechou|[\p{Emoji_Presentation}\u{1F44D}\u{1F44C}\u{1F64F}]+)\s*[.!]*\s*$/iu;
 
 // Núcleo canônico de um número BR p/ COMPARAÇÃO (ignora o 9º dígito de celular).
 // Ex.: 5584994610845 (13) e 558494610845 (12) viram o mesmo núcleo → casam.
@@ -424,11 +440,12 @@ Não invente o que não dá pra ver.`;
 // Resposta quando o lead JÁ foi encaminhado ao especialista: tira dúvidas
 // pontuais de forma natural, sem refazer a qualificação nem repetir o resumo.
 async function gerarRespostaPosEncaminhamento(leadData, mensagemCliente, historicoRecente = []) {
-    const fallback = 'Já repassei tudo pro nosso consultor, ele continua seu atendimento aqui rapidinho 😊 Se quiser adiantar algo, pode me contar que eu anoto pro time. Ficou alguma dúvida sobre a moto?';
+    const fallback = 'Já repassei tudo pro nosso consultor, ele continua seu atendimento aqui rapidinho 😊';
     try {
         const prompt = `Este lead já foi ENCAMINHADO a um consultor humano da Avelloz Campina. Ele acabou de dizer: "${String(mensagemCliente).replace(/[<>]/g, '').substring(0, 600)}".
-Responda de forma breve, calorosa e útil (registro de WhatsApp, sem markdown, no máximo 1 emoji), SEMPRE terminando com uma pergunta:
-- Se for uma dúvida simples sobre as motos/condições, responda com o que você sabe.
+Responda de forma breve, calorosa e útil (registro de WhatsApp, sem markdown, no máximo 1 emoji).
+NÃO puxe conversa. Só faça uma pergunta se ela for REALMENTE necessária para responder o que ele perguntou. É PROIBIDO terminar com "tem mais alguma dúvida?", "posso ajudar em algo mais?" ou qualquer variação: quem conduz o atendimento agora é o consultor humano, e ficar puxando assunto atropela o trabalho dele.
+- Se for uma dúvida simples sobre as motos/condições, responda com o que você sabe e PARE.
 - Se depender do consultor (valor de parcela, aprovação de crédito, prazo de entrega, negociação), diga que ele já vai continuar o atendimento pra resolver.
 - Se for sobre ${OFICINA.assuntos}, passe o telefone da nossa oficina: ${OFICINA.telefone}. Não diagnostique defeito nem cote peça/serviço.
 - Se for sobre INDICAÇÃO: ele passa o nome e o telefone do possível comprador pra um vendedor ANTES da compra; se o indicado fechar, ganha AZ1 R$ 50,00, AZ125 R$ 100,00, AZX160 R$ 150,00. Indicação reivindicada depois da compra fechada não é paga — diga isso com gentileza se for o caso.
@@ -460,9 +477,15 @@ async function encaminhar(chatId, leadData, departamento, mensagemCliente, histo
     const exp = expediente || estaEmExpediente();
     leadData.qualificacaoCompleta = true;
 
+    // Sinaliza na nota quando o lead pulou o funil por ter pedido pressa — o
+    // consultor recebe o resumo quase vazio e precisa saber que foi de propósito.
+    const tags = [
+        leadData.modoAtalho ? 'PEDIU AGILIDADE — SEM DIAGNÓSTICO' : null,
+        exp.aberto ? null : 'FORA DE EXPEDIENTE'
+    ].filter(Boolean);
     const transferencia = await notificarEquipe(leadData, chatId, {
         departamento,
-        tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE',
+        tagExtra: tags.length ? tags.join(' | ') : undefined,
         proximoExpediente: exp.aberto ? null : exp.proximoExpediente
     });
 
@@ -570,8 +593,35 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
             }
         }
 
-        // Lead já encaminhado → só tira dúvidas pontuais, sem refazer o funil
+        // Lead já encaminhado → só tira dúvidas pontuais, sem refazer o funil.
+        // E agora existe um FIM: quando o cliente sinaliza que só vai aguardar, a IA
+        // se despede e CALA para sempre. Antes ela era obrigada a terminar toda
+        // resposta com uma pergunta e nunca parava — o cliente respondia "não" e ela
+        // perguntava de novo, indefinidamente, ainda por cima falando por cima do
+        // consultor humano que já tinha assumido o ticket.
         if (leadData.finalizado) {
+            // Já se despediu: silêncio absoluto. Só registra a mensagem no histórico
+            // para o consultor ter o contexto completo no ticket.
+            if (leadData.conversaEncerrada) {
+                leadData.conversationHistory.push({ role: 'user', content: texto });
+                console.log(`🤫 ${chatId}: conversa encerrada pós-transferência — IA em silêncio.`);
+                return;
+            }
+
+            leadData.respostasPosHandoff = (leadData.respostasPosHandoff || 0) + 1;
+            const sinalFim = SINAL_ENCERRAMENTO.test(texto);
+            const estourouTeto = leadData.respostasPosHandoff > MAX_RESPOSTAS_POS_HANDOFF;
+
+            if (sinalFim || estourouTeto) {
+                leadData.conversaEncerrada = true;
+                const despedida = 'Combinado! Nosso consultor assume o seu atendimento daqui 😊';
+                await enviarMensagem(chatId, despedida);
+                leadData.conversationHistory.push({ role: 'user', content: texto });
+                leadData.conversationHistory.push({ role: 'assistant', content: despedida });
+                console.log(`👋 ${chatId}: encerrado pós-transferência (${sinalFim ? 'cliente sinalizou fim' : `teto de ${MAX_RESPOSTAS_POS_HANDOFF} respostas`}).`);
+                return;
+            }
+
             const histPos = leadData.conversationHistory.slice(-30).map(h => ({
                 role: h.role === 'user' ? 'user' : 'assistant', content: h.content
             }));
@@ -737,6 +787,33 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
                 return;
             }
+
+            // Sinalizou PRESSA sem pedir transferência ("pouco tempo", "direto ao
+            // assunto"). Abandona o funil: o único dado que ainda falta para
+            // transferir é a LOJA — sem ela o destino vira "Agente IA", que não tem
+            // ID e deixa o ticket parado onde já está.
+            if ((extraido.querAvancar || PEDE_AGILIDADE.test(texto)) && !leadData.finalizado) {
+                if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
+                usuarioNoHistorico = true;
+                leadData.modoAtalho = true;
+
+                if (leadData.loja) {
+                    const hist = leadData.conversationHistory.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.content }));
+                    await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
+                    return;
+                }
+                // Pergunta FIXA e única, sem passar pelo modelo: quem pediu
+                // objetividade não pode receber mais um parágrafo de qualificação.
+                // Na 2ª vez cai no fluxo normal, que com modoAtalho já pede só a loja.
+                if (!leadData.atalhoPerguntado) {
+                    leadData.atalhoPerguntado = true;
+                    const msg = 'Claro! Só preciso de uma informação pra te passar pro consultor: você prefere ser atendido na Matriz, na Malvinas (Campina Grande) ou em Monteiro?';
+                    await enviarMensagem(chatId, msg);
+                    leadData.conversationHistory.push({ role: 'assistant', content: msg });
+                    console.log(`⏩ ${chatId}: pressa detectada — funil pulado, pedindo só a loja.`);
+                    return;
+                }
+            }
         }
 
         // --- Próximo passo + resposta ---
@@ -784,9 +861,16 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
         // o ticket realmente entrou na fila do departamento da loja escolhida.
         let transferencia = null;
         if (leadData.qualificacaoCompleta && !leadData.finalizado) {
+            // O lead que veio pelo ATALHO chega sem diagnóstico (ele pediu pressa e a
+            // IA pulou o funil). O consultor precisa saber disso na nota, senão recebe
+            // um resumo cheio de "Não informado" sem entender por quê.
+            const tags = [
+                leadData.modoAtalho ? 'PEDIU AGILIDADE — SEM DIAGNÓSTICO' : null,
+                exp.aberto ? null : 'FORA DE EXPEDIENTE — AGENDAR RETORNO'
+            ].filter(Boolean);
             transferencia = await notificarEquipe(leadData, chatId, {
                 departamento: departamentoLead(leadData),
-                tagExtra: exp.aberto ? undefined : 'FORA DE EXPEDIENTE — AGENDAR RETORNO',
+                tagExtra: tags.length ? tags.join(' | ') : undefined,
                 proximoExpediente: exp.aberto ? null : exp.proximoExpediente
             });
             leadData.transferidoOk = transferencia.ok;

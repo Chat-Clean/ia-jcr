@@ -115,7 +115,14 @@ const PEDE_TRANSFERENCIA = /\b(me\s+transfir\w*|pode(m)?\s+transferir|quero\s+se
 // Rede de segurança do campo querAvancar da extração — o modelo costuma tratar
 // essas frases como conversa normal e devolver false, deixando o funil rodar e
 // irritando ainda mais quem já disse que tem pressa.
-const PEDE_AGILIDADE = /(diret[oa]s?\s+(ao|pro|para\s+o)\s+(assunto|ponto)|ir\s+ao\s+ponto|sem\s+(enrola|rodeio)|para\s+de\s+perguntar|muita(s)?\s+pergunta|quantas\s+perguntas|pouco\s+tempo|sem\s+tempo|t[ôo]\s+com\s+pressa|com\s+pressa|(quanto\s+custa|qual\s+o\s+pre[çc]o|me\s+manda\s+o\s+pre[çc]o).{0,15}(logo|agora|direto)|vamos?\s+(logo|direto)|resolver\s+r[áa]pido)/i;
+//
+// CUIDADO ao acrescentar padrões aqui: este regex NÃO sabe qual pergunta a IA
+// acabou de fazer, então só cabem frases inequívocas em QUALQUER contexto. Ex.:
+// "pouco tempo" está fora de propósito — é a resposta natural para "quanto tempo
+// você perde no trânsito?", e incluí-la abortava o funil no meio de uma conversa
+// que estava correndo bem. Frases ambíguas ficam com querAvancar, que enxerga o
+// histórico e sabe distinguir pedido de avanço de resposta a uma pergunta.
+const PEDE_AGILIDADE = /(diret[oa]s?\s+(ao|pro|para\s+o)\s+(assunto|ponto)|ir\s+ao\s+ponto|sem\s+(enrola|rodeio)|para\s+de\s+perguntar|muita(s)?\s+pergunta|quantas\s+perguntas|(t[ôo]|estou|to)\s+(com\s+pressa|sem\s+tempo)|n[ãa]o\s+tenho\s+tempo|(quanto\s+custa|qual\s+o\s+pre[çc]o|me\s+manda\s+o\s+pre[çc]o).{0,15}(logo|agora|direto)|vamos?\s+(logo|direto)|resolver\s+r[áa]pido)/i;
 
 // Sinais de ENCERRAMENTO: o cliente não tem mais nada a tratar e só vai aguardar
 // o consultor. Rede de segurança do campo encerrouConversa. Ancorado no início da

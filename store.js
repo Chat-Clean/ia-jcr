@@ -5,11 +5,11 @@
 //
 //  Env:
 //    REDIS_URL     = redis://:senha@host:6379  (ex.: instância da Hostinger)
-//    REDIS_PREFIX  = namespace das chaves (padrão: avellozcg)
+//    REDIS_PREFIX  = namespace das chaves (padrão: iajcr)
 // =============================================================
 
 const REDIS_URL    = process.env.REDIS_URL || '';
-const PREFIX       = process.env.REDIS_PREFIX || 'avellozcg';
+const PREFIX       = process.env.REDIS_PREFIX || 'iajcr';
 const LEAD_TTL_SEG = 60 * 60 * 24 * 30;   // 30 dias — conversas paradas expiram sozinhas
 
 let redis = null;

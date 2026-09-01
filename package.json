@@ -1,7 +1,7 @@
 {
-  "name": "iaavellozcg",
+  "name": "iajcr",
   "version": "1.0.0",
-  "description": "IA de Atendimento Avelloz Campina — IA externa de captação e qualificação de leads (Webhook + Push API ChatClean)",
+  "description": "IA de Atendimento Avelloz JCR (JCR Motos — João Pessoa/PB) — IA externa de captação e qualificação de leads (Webhook + Push API ChatClean)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

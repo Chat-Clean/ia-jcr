@@ -91,7 +91,7 @@ function mostrarEstado() {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-console.log('\n💬 IA Avelloz Campina — tester local (gpt-4o-mini)');
+console.log('\n💬 IA Avelloz JCR — tester local (gpt-4o-mini)');
 console.log('   Digite como se fosse o cliente. Comandos: /reset  /estado  /sair\n');
 rl.setPrompt('você > ');
 rl.prompt();

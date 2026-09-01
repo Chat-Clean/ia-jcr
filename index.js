@@ -70,9 +70,9 @@ const TRANSFERIR_FECHANDO = (process.env.TRANSFERIR_FECHANDO || 'false') === 'tr
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, DEPARTAMENTO_IDS, departamentoId, lojaParaDepartamento, OFICINA } = require('./data');
+const { EMPRESA_INFO, PERFIS, DEPARTAMENTOS, DEPARTAMENTO_IDS, departamentoId, lojaParaDepartamento } = require('./data');
 const { SYSTEM_SDR, promptExtracao, promptResposta } = require('./prompts');
-const { determinarProximoCampo, aplicarCampos, detectarPerfil, detectarModeloMencionado } = require('./flow');
+const { determinarProximoCampo, aplicarCampos, detectarPerfil, detectarModeloMencionado, checarCoerenciaFinanceira } = require('./flow');
 
 // Departamento de transbordo do lead = a loja que ele escolheu (obrigatória
 // no fluxo). Sem loja identificada, permanece no Agente IA (a porta de entrada).
@@ -185,7 +185,7 @@ async function ccPush(number, payloadExtra = {}) {
 // Transfere o ticket do cliente para o DEPARTAMENTO (fila) da unidade escolhida.
 // A Push API espera DOIS campos: forceTicketToDepartment = true (interruptor) e
 // queueId = ID do departamento no CRM (Configurações → Departamentos):
-// Matriz 228, Malvinas 230, Monteiro 231.
+// Loja Geisel 249, Loja Matriz 250.
 //
 // Retorna { ok, id, departamento, motivo, resposta }. O ok é o que autoriza a IA
 // a CONFIRMAR a transferência para o cliente — sem ele, prometer "já te
@@ -266,17 +266,23 @@ function montarResumo(leadData, chatId, opcoes = {}) {
     const departamento = opcoes.departamento || departamentoLead(leadData);
     const perfilNome = leadData.perfilKey && PERFIS[leadData.perfilKey]
         ? PERFIS[leadData.perfilKey].nome : 'Não informado';
-    const temDadosSim = leadData.nomeCompleto || leadData.cpf || leadData.dataNascimento || leadData.telefone || leadData.cnh || leadData.corModelo;
-    return `🏍️ LEAD QUALIFICADO — Avelloz Campina${opcoes.tagExtra ? ' [' + opcoes.tagExtra + ']' : ''}\n\n` +
+    const temDadosSim = leadData.nomeCompleto || leadData.cpf || leadData.dataNascimento || leadData.telefone || leadData.cnh || leadData.renda || leadData.corModelo;
+    return `🏍️ LEAD QUALIFICADO — Avelloz JCR${opcoes.tagExtra ? ' [' + opcoes.tagExtra + ']' : ''}\n\n` +
         `Contato: ${leadData.nome || 'Lead'} (${chatId})\n` +
         `Perfil: ${perfilNome}\n` +
         `Finalidade: ${leadData.finalidade || 'Não informado'}\n` +
         `Transporte hoje: ${leadData.transporteAtual || 'Não informado'}\n` +
         `Gasto atual: ${leadData.gastoMensal || 'Não informado'}\n` +
         `Situação de moto: ${leadData.situacaoMoto || 'Não informado'}\n` +
+        `Tempo perdido/dia: ${leadData.tempoPerdido || 'Não informado'}\n` +
         `Modelo de interesse: ${leadData.modeloInteresse || 'Não informado'}\n` +
-        `Forma de pagamento: ${leadData.formaPagamento || 'Não informado'}\n` +
-        `Loja escolhida: ${leadData.loja || 'Não informada'}\n` +
+        `\nDiagnóstico financeiro:\n` +
+        `  Forma de pagamento: ${leadData.formaPagamento || 'Não informado'}\n` +
+        `  Entrada: ${leadData.entrada || 'Não informado'}\n` +
+        `  Parcela desejada: ${leadData.parcelaDesejada || 'Não informado'}\n` +
+        `  Parcela máxima: ${leadData.parcelaMaxima || 'Não informado'}\n` +
+        `  Restrição no nome: ${leadData.restricaoNome || 'Não informado'}${leadData.cienciaRestricao ? ' (ciente do impacto na aprovação)' : ''}\n` +
+        `\nLoja escolhida: ${leadData.loja || 'Não informada'}\n` +
         (temDadosSim
             ? `\nDados p/ simulação:\n` +
               `  Nome completo: ${leadData.nomeCompleto || 'Não informado'}\n` +
@@ -284,6 +290,7 @@ function montarResumo(leadData, chatId, opcoes = {}) {
               `  Nascimento: ${leadData.dataNascimento || 'Não informado'}\n` +
               `  Telefone: ${leadData.telefone || 'Não informado'}\n` +
               `  CNH: ${leadData.cnh || 'Não informado'}\n` +
+              `  Renda: ${leadData.renda || 'Não informada'}\n` +
               `  Cor/modelo: ${leadData.corModelo || 'Não informado'}\n`
             : '') +
         (opcoes.proximoExpediente ? `Retorno sugerido: ${opcoes.proximoExpediente}\n` : '') +
@@ -333,8 +340,17 @@ async function notificarEquipe(leadData, chatId, opcoes = {}) {
 //  FOLLOW-UP DE REATIVAÇÃO (durável — sobrevive a redeploy)
 //  Guarda leadData.followUpDueAt e um varredor dispara os vencidos.
 // =============================================================
-const TEMPO_INATIVIDADE = 30 * 60 * 1000; // 30 min sem resposta → reativação
-const FOLLOWUP_SWEEP    = 2 * 60 * 1000;  // varre a cada 2 min
+// Regra da JCR: "sumiço do cliente — se passar 5 minutos sem resposta, transfira
+// pro departamento Loja Matriz". Aqui isso vira DUAS coisas no mesmo vencimento:
+// a mensagem de reativação e, quando o lead já tem conteúdo, a transferência real
+// pra unidade (a que ele escolheu; sem escolha, a Matriz).
+// Um lead que só disse "oi" e sumiu NÃO é transferido na 1ª vez: ele leva a
+// reativação e ganha mais uma janela — senão a fila da Matriz recebe um ticket
+// vazio de todo mundo que demorou 6 minutos pra responder.
+const MINUTOS_INATIVIDADE = parseFloat(process.env.MINUTOS_INATIVIDADE || '5');
+const TEMPO_INATIVIDADE = Math.max(1, MINUTOS_INATIVIDADE) * 60 * 1000;
+const FOLLOWUP_SWEEP    = 60 * 1000;      // varre a cada 1 min
+const TRANSFERIR_NO_SUMICO = process.env.TRANSFERIR_NO_SUMICO !== 'false';
 
 function agendarFollowUpReativacao(leadData) {
     if (leadData.finalizado) { leadData.followUpDueAt = null; return; }
@@ -349,19 +365,53 @@ function montarMsgReativacao(leadData) {
     if (proximo.campo === 'finalidade')      return `${oi}! Ainda por aí? Me conta pra que você quer a moto no dia a dia que eu te ajudo a achar a certa 😊`;
     if (proximo.campo === 'transporteAtual') return `${oi}, ainda por aí? Como você tá se locomovendo hoje — Uber, ônibus, carro?`;
     if (proximo.campo === 'gastoMensal')     return `${oi}, seguindo de onde paramos: mais ou menos quanto você gasta por mês com transporte hoje?`;
+    if (proximo.campo === 'tempoPerdido')    return `${oi}, ainda por aí? Só me diz uma coisa: quanto tempo por dia você perde hoje esperando condução ou parado no trânsito?`;
     if (proximo.campo === 'modeloInteresse') return `${oi}, ainda por aí? Quer que eu te indique o modelo que mais encaixa no seu dia a dia?`;
-    if (proximo.campo === 'loja')            return `${oi}, pra eu já adiantar com o consultor: qual unidade fica melhor pra você — Matriz, Malvinas ou Monteiro?`;
+    if (proximo.campo === 'loja')            return `${oi}, pra eu já adiantar com o consultor: qual unidade fica melhor pra você — a Matriz, em Mangabeira, ou a Loja Geisel, no Cuiá?`;
     return `${oi}, ainda por aí? Se quiser, seguimos de onde paramos que eu já organizo tudo pro nosso consultor 😊`;
+}
+
+// O lead já disse alguma coisa que valha a pena um humano ver? Um "oi" solto não
+// conta — transferir isso só entope a fila da loja.
+function leadTemConteudo(leadData) {
+    return !!(leadData.finalidade || leadData.transporteAtual || leadData.gastoMensal ||
+              leadData.situacaoMoto || leadData.tempoPerdido || leadData.modeloInteresse ||
+              leadData.formaPagamento || leadData.loja || leadData.cpf);
 }
 
 async function dispararFollowUpReativacao(chatId, leadData) {
     const msg = montarMsgReativacao(leadData);
     leadData.followUpDueAt = null;
+
+    // SUMIÇO DO CLIENTE (regra da JCR): venceu o tempo e o lead já tem conteúdo,
+    // ou já levou uma reativação antes e continua mudo → a IA sai de cena e o
+    // ticket vai pra unidade escolhida (sem escolha, a Matriz).
+    const jaReativou = !!leadData.followUpUltimo;
+    if (TRANSFERIR_NO_SUMICO && !leadData.finalizado && (leadTemConteudo(leadData) || jaReativou)) {
+        const departamento = lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.matriz;
+        if (msg && leadData.followUpUltimo !== msg) {
+            leadData.followUpUltimo = msg;
+            await enviarMensagem(chatId, msg);
+        }
+        const transferencia = await notificarEquipe(leadData, chatId, {
+            departamento,
+            tagExtra: `SUMIÇO — SEM RESPOSTA HÁ ${MINUTOS_INATIVIDADE} MIN`
+        });
+        leadData.transferidoOk = transferencia.ok;
+        leadData.finalizado = true;
+        try { await store.saveLead(chatId, leadData); } catch (_) {}
+        console.log(`🕓 ${chatId}: sumiço — encaminhado para ${departamento} (transferiu: ${transferencia.ok}).`);
+        return;
+    }
+
     if (!msg || leadData.followUpUltimo === msg) {
         try { await store.saveLead(chatId, leadData); } catch (_) {}
         return;
     }
     leadData.followUpUltimo = msg;
+    // Lead ainda sem conteúdo: ganha a reativação e mais uma janela antes de
+    // qualquer transferência.
+    leadData.followUpDueAt = Date.now() + TEMPO_INATIVIDADE;
     try { await store.saveLead(chatId, leadData); } catch (_) {}
     await enviarMensagem(chatId, msg);
     console.log(`📩 Follow-up de reativação enviado para ${chatId}`);
@@ -414,6 +464,10 @@ async function gerarRespostaIA(leadData, mensagemCliente, proximoCampo, historic
     const mensagemSanitizada = mensagemCliente.replace(/[<>]/g, '').substring(0, 1000);
     const isInicioConversa = leadData.conversationHistory.length === 0;
     const prompt = promptResposta({ isInicioConversa, mensagemSanitizada, proximoCampo, leadData, expediente });
+    // A confrontação da incoerência (o cliente já gasta hoje mais do que topa
+    // pagar de parcela) é feita UMA vez: sem esta marca o rodapé mandaria a IA
+    // repetir a mesma cobrança em toda mensagem seguinte.
+    const vaiConfrontar = !leadData.coerenciaConfrontada && checarCoerenciaFinanceira(leadData).incoerente;
     const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
@@ -423,6 +477,7 @@ async function gerarRespostaIA(leadData, mensagemCliente, proximoCampo, historic
         ],
         temperature: 0.7
     });
+    if (vaiConfrontar) leadData.coerenciaConfrontada = true;
     return completion.choices[0].message.content.trim();
 }
 
@@ -431,7 +486,7 @@ async function gerarRespostaIA(leadData, mensagemCliente, proximoCampo, historic
 async function analisarImagem(mediaUrl) {
     if (!mediaUrl) return null;
     try {
-        const instrucao = `Você é atendente da Avelloz Campina (concessionária de motos). O cliente enviou esta imagem no WhatsApp durante o atendimento. Descreva de forma curta e útil (1 a 3 frases, tom natural, SEM markdown) o que é e o que há de relevante para entender a necessidade dele:
+        const instrucao = `Você é atendente da Avelloz JCR (concessionária de motos em João Pessoa/PB). O cliente enviou esta imagem no WhatsApp durante o atendimento. Descreva de forma curta e útil (1 a 3 frases, tom natural, SEM markdown) o que é e o que há de relevante para entender a necessidade dele:
 - Se for uma foto de moto (dele ou de um modelo), diga o que dá pra entender (modelo/estado/cor, se dá pra saber).
 - Se for um PRINT de conversa, anúncio ou simulação, resuma do que se trata.
 - Se for um documento (CNH, comprovante, print de dados), diga o que é sem transcrever dados sensíveis.
@@ -460,18 +515,17 @@ Não invente o que não dá pra ver.`;
 async function gerarRespostaPosEncaminhamento(leadData, mensagemCliente, historicoRecente = []) {
     const fallback = 'Já repassei tudo pro nosso consultor, ele continua seu atendimento aqui rapidinho 😊';
     try {
-        const prompt = `Este lead já foi ENCAMINHADO a um consultor humano da Avelloz Campina. Ele acabou de dizer: "${String(mensagemCliente).replace(/[<>]/g, '').substring(0, 600)}".
+        const prompt = `Este lead já foi ENCAMINHADO a um consultor humano da Avelloz JCR (JCR Motos). Ele acabou de dizer: "${String(mensagemCliente).replace(/[<>]/g, '').substring(0, 600)}".
 Responda de forma breve, calorosa e útil (registro de WhatsApp, sem markdown, no máximo 1 emoji).
 NÃO puxe conversa. Só faça uma pergunta se ela for REALMENTE necessária para responder o que ele perguntou. É PROIBIDO terminar com "tem mais alguma dúvida?", "posso ajudar em algo mais?" ou qualquer variação: quem conduz o atendimento agora é o consultor humano, e ficar puxando assunto atropela o trabalho dele.
 - Se for uma dúvida simples sobre as motos/condições, responda com o que você sabe e PARE.
 - Se depender do consultor (valor de parcela, aprovação de crédito, prazo de entrega, negociação), diga que ele já vai continuar o atendimento pra resolver.
-- Se for sobre ${OFICINA.assuntos}, passe o telefone da nossa oficina: ${OFICINA.telefone}. Não diagnostique defeito nem cote peça/serviço.
-- Se for sobre INDICAÇÃO: ele passa o nome e o telefone do possível comprador pra um vendedor ANTES da compra; se o indicado fechar, ganha AZ1 R$ 50,00, AZ125 R$ 100,00, AZX160 R$ 150,00. Indicação reivindicada depois da compra fechada não é paga — diga isso com gentileza se for o caso.
+- Se for sobre peças, revisão, manutenção, garantia ou assistência técnica, diga que o time da loja resolve isso com ele e NÃO tente diagnosticar defeito nem cotar peça/serviço.
 Nunca informe valor de parcela nem prometa prazo. Não refaça a qualificação e não repita o resumo.`;
         const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [
-                { role: 'system', content: 'Você é um consultor do time da Avelloz Campina. Escrita natural, curta, registro de WhatsApp.' },
+                { role: 'system', content: 'Você é um consultor do time da Avelloz JCR (JCR Motos). Escrita natural, curta, registro de WhatsApp.' },
                 ...historicoRecente,
                 { role: 'user', content: prompt }
             ],
@@ -787,8 +841,8 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
             if (extraido.tipoContato === 'cliente' && !leadData.finalizado) {
                 if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
                 const msgCliente = extraido.assunto === 'pecas_revisao'
-                    ? `Entendi! Pra ${OFICINA.assuntos} quem te atende direitinho é a nossa oficina, no ${OFICINA.telefone} 😊 Já vou avisar nosso time de pós-venda aqui também. Você comprou em qual unidade (Matriz, Malvinas ou Monteiro)?`
-                    : 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer qual unidade você comprou (Matriz, Malvinas ou Monteiro)?';
+                    ? 'Entendi! Revisão, peça e garantia quem resolve é o time da loja, e eu já vou avisar eles aqui. Você comprou em qual unidade — a Matriz, em Mangabeira, ou a Loja Geisel, no Cuiá?'
+                    : 'Entendi! Vou te encaminhar pro nosso time de pós-venda, que já cuida disso com você. Pode me dizer em qual unidade você comprou — a Matriz, em Mangabeira, ou a Loja Geisel, no Cuiá?';
                 await enviarMensagem(chatId, msgCliente);
                 await notificarEquipe(leadData, chatId, { departamento: departamentoPosVenda(leadData), tagExtra: 'CLIENTE ATUAL' });
                 leadData.finalizado = true;
@@ -825,7 +879,7 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 // Na 2ª vez cai no fluxo normal, que com modoAtalho já pede só a loja.
                 if (!leadData.atalhoPerguntado) {
                     leadData.atalhoPerguntado = true;
-                    const msg = 'Claro! Só preciso de uma informação pra te passar pro consultor: você prefere ser atendido na Matriz, na Malvinas (Campina Grande) ou em Monteiro?';
+                    const msg = 'Claro! Só preciso de uma informação pra te passar pro consultor: você prefere ser atendido na Loja Matriz, em Mangabeira, ou na Loja Geisel, no Cuiá?';
                     await enviarMensagem(chatId, msg);
                     leadData.conversationHistory.push({ role: 'assistant', content: msg });
                     console.log(`⏩ ${chatId}: pressa detectada — funil pulado, pedindo só a loja.`);
@@ -1263,7 +1317,7 @@ app.get('/diag', async (req, res) => {
 });
 
 // Testa a transferência de um ticket SEM precisar refazer a conversa inteira.
-// Ex.: /diag/transferir?key=ADMIN&numero=5583999999999&loja=malvinas
+// Ex.: /diag/transferir?key=ADMIN&numero=5583999999999&loja=geisel
 // Retorna a resposta CRUA do CRM — é assim que se descobre por que um ticket não
 // muda de fila. Não manda nada para o cliente (a nota é interna).
 app.get('/diag/transferir', async (req, res) => {

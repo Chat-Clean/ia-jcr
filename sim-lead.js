@@ -33,12 +33,17 @@ const ROTEIRO = [
     'quero uma moto pra trabalhar de aplicativo',
     'hoje eu rodo de moto alugada',                         // transporte + situação
     'pago 250 por semana de aluguel, a moto não é minha',  // gasto + situação de moto
-    'perco um tempão quando a alugada dá problema',
+    'perco uns 40 minutos por dia parado no trânsito',     // tempoPerdido
+    'ia aproveitar pra almoçar em casa com minha filha',   // ganhoTempo (aprofundamento emocional)
     'qual moto vocês indicam pra mim?',                     // <- diagnóstico OK: pode apresentar
     'gostei da AZ125',                                      // modeloInteresse
     'seria no financiamento',                               // formaPagamento
-    'meu nome é Rafael, CPF 12345678900, nasci 10/05/1995, telefone 83999998888, tenho CNH, quero a AZ125 vermelha', // dados
-    'pode ser na loja Malvinas'                             // loja
+    'prefiro ver a de entrada zero',                        // entrada
+    'uns 400 reais de parcela tava bom',                    // parcelaDesejada <- INCOERENTE: já paga ~1075/mês de aluguel
+    'no máximo uns 700 sem apertar',                        // parcelaMaxima
+    'tenho sim uma restrição no Serasa, mas sei que pode pesar', // restricaoNome + ciência
+    'meu nome é Rafael, CPF 12345678900, nasci 10/05/1995, telefone 83999998888, tenho CNH, minha renda é 2500, quero a AZ125 vermelha', // dados
+    'pode ser na loja Geisel'                               // loja
 ];
 
 async function extrair(mensagem, campoAtual, hist) {
@@ -67,9 +72,9 @@ async function responder(mensagem, proximoCampo, hist) {
 
 function resumoEquipe() {
     const perfilNome = leadData.perfilKey && PERFIS[leadData.perfilKey] ? PERFIS[leadData.perfilKey].nome : 'Não informado';
-    const departamento = lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.geral;
+    const departamento = lojaParaDepartamento(leadData.loja) || DEPARTAMENTOS.entrada;
     return [
-        '🏍️ LEAD QUALIFICADO — Avelloz Campina',
+        '🏍️ LEAD QUALIFICADO — Avelloz JCR',
         '',
         `Contato: ${leadData.nome || 'Lead'} (${chatId})`,
         `Perfil: ${perfilNome}`,
@@ -77,8 +82,16 @@ function resumoEquipe() {
         `Transporte hoje: ${leadData.transporteAtual || 'Não informado'}`,
         `Gasto atual: ${leadData.gastoMensal || 'Não informado'}`,
         `Situação de moto: ${leadData.situacaoMoto || 'Não informado'}`,
+        `Tempo perdido/dia: ${leadData.tempoPerdido || 'Não informado'}`,
         `Modelo de interesse: ${leadData.modeloInteresse || 'Não informado'}`,
-        `Forma de pagamento: ${leadData.formaPagamento || 'Não informado'}`,
+        '',
+        'Diagnóstico financeiro:',
+        `  Forma de pagamento: ${leadData.formaPagamento || 'Não informado'}`,
+        `  Entrada: ${leadData.entrada || 'Não informado'}`,
+        `  Parcela desejada: ${leadData.parcelaDesejada || 'Não informado'}`,
+        `  Parcela máxima: ${leadData.parcelaMaxima || 'Não informado'}`,
+        `  Restrição no nome: ${leadData.restricaoNome || 'Não informado'}`,
+        '',
         `Loja escolhida: ${leadData.loja || 'Não informada'}`,
         '',
         'Dados p/ simulação:',
@@ -87,6 +100,7 @@ function resumoEquipe() {
         `  Nascimento: ${leadData.dataNascimento || 'Não informado'}`,
         `  Telefone: ${leadData.telefone || 'Não informado'}`,
         `  CNH: ${leadData.cnh || 'Não informado'}`,
+        `  Renda: ${leadData.renda || 'Não informada'}`,
         `  Cor/modelo: ${leadData.corModelo || 'Não informado'}`,
         '',
         `➡️ Transferir para o departamento ${departamento}${exp.aberto ? '' : ' [FORA DE EXPEDIENTE — AGENDAR RETORNO]'}`

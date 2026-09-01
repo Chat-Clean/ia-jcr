@@ -109,7 +109,7 @@ const PROMETE_TRANSFERENCIA = /transferi|transferindo|repassando|repassei|encami
 // Pedidos INEQUÍVOCOS de transferência. De propósito não inclui "quero falar com
 // humano": essa frase aparece negada com frequência ("não quero falar com humano")
 // e o julgamento de intenção nesse caso fica com a IA, na extração.
-const PEDE_TRANSFERENCIA = /\b(me\s+transfir\w*|pode(m)?\s+transferir|quero\s+ser\s+transferid\w*|me\s+passa\s+(pro|para\s+o?)\s*(vendedor|consultor|atendente)|chama\s+(um\s+)?(vendedor|consultor|atendente))\b/i;
+const PEDE_TRANSFERENCIA = /\b(me\s+transf(ir|er)\w*|(pode(m)?|quero|queria|pods?)\s+transferir|quero\s+ser\s+transferid\w*|me\s+passa\s+(pro|para\s+o?)\s*(vendedor|consultor|atendente)|(quero|falar\s+com)\s+(um\s+)?(vendedor|consultor|atendente|humano|pessoa)|chama\s+(um\s+)?(vendedor|consultor|atendente))\b/i;
 
 // IMPACIÊNCIA: o cliente não pediu ninguém, mas quer que o atendimento ANDE.
 // Rede de segurança do campo querAvancar da extração — o modelo costuma tratar
@@ -399,6 +399,9 @@ async function dispararFollowUpReativacao(chatId, leadData) {
         });
         leadData.transferidoOk = transferencia.ok;
         leadData.finalizado = true;
+        // Só cala de vez se o ticket REALMENTE mudou de fila. Se a transferência
+        // falhou, o cliente que voltar ainda precisa de alguém pra responder.
+        if (transferencia.ok) leadData.conversaEncerrada = true;
         try { await store.saveLead(chatId, leadData); } catch (_) {}
         console.log(`🕓 ${chatId}: sumiço — encaminhado para ${departamento} (transferiu: ${transferencia.ok}).`);
         return;
@@ -541,6 +544,25 @@ Nunca informe valor de parcela nem prometa prazo. Não refaça a qualificação 
 // =============================================================
 //  ENCAMINHAMENTO PARA HUMANO
 // =============================================================
+// Pergunta FIXA da unidade (sem passar pelo modelo). Usada sempre que o cliente
+// pede atendente ou demonstra pressa e ainda NÃO escolheu loja: sem ela o
+// destino seria "Agente IA", que é exatamente onde o ticket já está — o cliente
+// ficaria esperando um humano que nunca foi acionado.
+const PERGUNTA_LOJA = 'Claro, já te passo pro consultor! Só me diz uma coisa antes: você prefere ser atendido na Loja Matriz, em Mangabeira, ou na Loja Geisel, no Cuiá?';
+
+// Mensagem FINAL do atendimento: confirma o nome do departamento de destino e
+// encerra. Depois dela a IA fica em SILÊNCIO permanente (conversaEncerrada), pra
+// não falar por cima do consultor humano que assumiu o ticket. Por isso ela é
+// fixa e NÃO termina em pergunta — é a única mensagem do bot que pode fechar.
+function mensagemHandoffFinal(departamento, exp) {
+    const destino = departamento === DEPARTAMENTOS.entrada ? 'nosso time' : `time da ${departamento}`;
+    // Sem pergunta no fim, de propósito: é a única mensagem do bot que fecha a
+    // conversa. Convidar resposta aqui só faria o cliente escrever no vazio.
+    return exp.aberto
+        ? `Prontinho! Transferi seu atendimento pro ${destino} 🎉 A partir de agora um consultor humano continua com você por aqui mesmo.`
+        : `Prontinho! Transferi seu atendimento pro ${destino}. Um consultor humano te retorna ${exp.proximoExpediente}, por aqui mesmo.`;
+}
+
 // A ORDEM aqui é a regra de negócio: transfere PRIMEIRO, confirma DEPOIS. A IA só
 // diz "já te passei pro consultor" quando o ticket realmente entrou na fila do
 // departamento. Se a transferência falhar, ela responde sem prometer a passagem
@@ -563,14 +585,12 @@ async function encaminhar(chatId, leadData, departamento, mensagemCliente, histo
 
     let msg;
     if (transferencia.ok) {
-        // Deixa a IA escrever o handoff de forma calorosa (branch de qualificação completa)
-        try {
-            msg = await gerarRespostaIA(leadData, mensagemCliente, null, historico, exp);
-        } catch (_) {
-            msg = exp.aberto
-                ? 'Perfeito! Já tô repassando tudo pro nosso consultor. Ele assume seu atendimento aqui rapidinho, combinado?'
-                : `Perfeito, deixei tudo registrado! Nosso consultor te retorna ${exp.proximoExpediente}. Enquanto isso, ficou alguma dúvida sobre a moto?`;
-        }
+        // Transferência CONFIRMADA: mensagem final fixa nomeando o departamento e
+        // silêncio permanente. Nada de deixar o modelo escrever aqui — o cliente
+        // precisa saber pra qual unidade foi, e a IA não pode continuar puxando
+        // conversa por cima do consultor que acabou de assumir.
+        msg = mensagemHandoffFinal(departamento, exp);
+        leadData.conversaEncerrada = true;
     } else {
         // Sem transferência confirmada: NÃO prometa que já passou pro consultor.
         console.warn(`⚠️ ${chatId}: confirmação de transferência suprimida — ${transferencia.motivo}`);
@@ -849,22 +869,22 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 return;
             }
 
-            // Pediu explicitamente falar com humano → encaminha ao consultor (loja/geral).
-            // O regex é rede de segurança: numa frase como "não quero falar com
-            // humano, me transfira" a negação confunde o modelo e ele devolve false,
-            // deixando o cliente falando sozinho. Só padrões inequívocos entram aqui.
-            if ((extraido.querFalarComHumano || PEDE_TRANSFERENCIA.test(texto)) && !leadData.finalizado) {
-                const hist = leadData.conversationHistory.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.content }));
-                if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
-                await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
-                return;
-            }
-
-            // Sinalizou PRESSA sem pedir transferência ("pouco tempo", "direto ao
-            // assunto"). Abandona o funil: o único dado que ainda falta para
-            // transferir é a LOJA — sem ela o destino vira "Agente IA", que não tem
-            // ID e deixa o ticket parado onde já está.
-            if ((extraido.querAvancar || PEDE_AGILIDADE.test(texto)) && !leadData.finalizado) {
+            // Pediu ATENDENTE ("me transfere", "quero falar com um vendedor") ou
+            // sinalizou PRESSA ("direto ao assunto"). Os dois casos caem aqui e
+            // seguem a MESMA regra: o funil é abandonado, mas a unidade é
+            // OBRIGATÓRIA antes de transferir.
+            //
+            // Antes o pedido de humano ia direto pro encaminhar() com o
+            // departamento padrão. Sem loja escolhida esse padrão é o "Agente IA",
+            // que é a própria fila onde o ticket já está: o cliente recebia "já te
+            // transferi" e continuava esperando um humano que ninguém chamou.
+            // Agora pergunta-se a unidade primeiro, sempre.
+            //
+            // O regex é rede de segurança: em "não quero falar com humano, me
+            // transfira" a negação confunde o modelo e ele devolve false.
+            const pediuHumano = extraido.querFalarComHumano || PEDE_TRANSFERENCIA.test(texto);
+            const temPressa   = extraido.querAvancar || PEDE_AGILIDADE.test(texto);
+            if ((pediuHumano || temPressa) && !leadData.finalizado) {
                 if (!usuarioNoHistorico) leadData.conversationHistory.push({ role: 'user', content: texto });
                 usuarioNoHistorico = true;
                 leadData.modoAtalho = true;
@@ -874,15 +894,16 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                     await encaminhar(chatId, leadData, departamentoLead(leadData), texto, hist, exp);
                     return;
                 }
-                // Pergunta FIXA e única, sem passar pelo modelo: quem pediu
-                // objetividade não pode receber mais um parágrafo de qualificação.
-                // Na 2ª vez cai no fluxo normal, que com modoAtalho já pede só a loja.
-                if (!leadData.atalhoPerguntado) {
-                    leadData.atalhoPerguntado = true;
-                    const msg = 'Claro! Só preciso de uma informação pra te passar pro consultor: você prefere ser atendido na Loja Matriz, em Mangabeira, ou na Loja Geisel, no Cuiá?';
-                    await enviarMensagem(chatId, msg);
-                    leadData.conversationHistory.push({ role: 'assistant', content: msg });
-                    console.log(`⏩ ${chatId}: pressa detectada — funil pulado, pedindo só a loja.`);
+
+                // Sem unidade: pergunta e espera a resposta. No máximo 2 vezes —
+                // se o cliente insistir em "me transfere" sem escolher, deixa o
+                // fluxo normal assumir (com modoAtalho ele pede só a loja, com
+                // outras palavras, em vez de repetir a mesma frase pra sempre).
+                leadData.vezesPerguntouLoja = (leadData.vezesPerguntouLoja || 0) + 1;
+                if (leadData.vezesPerguntouLoja <= 2) {
+                    await enviarMensagem(chatId, PERGUNTA_LOJA);
+                    leadData.conversationHistory.push({ role: 'assistant', content: PERGUNTA_LOJA });
+                    console.log(`⏩ ${chatId}: ${pediuHumano ? 'pediu atendente' : 'pressa'} sem loja — perguntando a unidade (${leadData.vezesPerguntouLoja}x).`);
                     return;
                 }
             }
@@ -932,7 +953,9 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
         // deliberada: a IA só pode confirmar a passagem para o cliente depois que
         // o ticket realmente entrou na fila do departamento da loja escolhida.
         let transferencia = null;
+        let departamentoDestino = null;
         if (leadData.qualificacaoCompleta && !leadData.finalizado) {
+            departamentoDestino = departamentoLead(leadData);
             // O lead que veio pelo ATALHO chega sem diagnóstico (ele pediu pressa e a
             // IA pulou o funil). O consultor precisa saber disso na nota, senão recebe
             // um resumo cheio de "Não informado" sem entender por quê.
@@ -941,12 +964,21 @@ async function processarMensagem({ chatId, contactId, texto, tipo, mediaBase64, 
                 exp.aberto ? null : 'FORA DE EXPEDIENTE — AGENDAR RETORNO'
             ].filter(Boolean);
             transferencia = await notificarEquipe(leadData, chatId, {
-                departamento: departamentoLead(leadData),
+                departamento: departamentoDestino,
                 tagExtra: tags.length ? tags.join(' | ') : undefined,
                 proximoExpediente: exp.aberto ? null : exp.proximoExpediente
             });
             leadData.transferidoOk = transferencia.ok;
             leadData.finalizado = true;
+        }
+
+        // Transferência CONFIRMADA: descarta o que a IA escreveu e manda a
+        // mensagem final fixa, que nomeia o departamento de destino. Depois dela a
+        // IA cala para sempre — quem conduz agora é o consultor humano.
+        if (transferencia && transferencia.ok) {
+            resposta = mensagemHandoffFinal(departamentoDestino, exp);
+            leadData.conversaEncerrada = true;
+            console.log(`✅ ${chatId}: transferido para ${departamentoDestino} — IA encerrada.`);
         }
 
         // A transferência não foi concluída, mas a IA escreveu que já repassou:

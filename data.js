@@ -28,7 +28,8 @@ const EMPRESA_INFO = {
 //  Regras (ver prompts.js): só liberar modelo/preço APÓS o diagnóstico
 //  mínimo. Nunca informar valor de PARCELA (transferir para humano).
 //  Nunca mudar o nome dos produtos: AZ1, AZ125, AZX160.
-//  ATENÇÃO: NUNCA dizer que o emplacamento está incluso.
+//  ATENÇÃO: NUNCA dizer que o emplacamento está incluso — EXCETO na
+//  AZX160, único modelo com valor com emplacamento fechado e liberado.
 // -------------------------------------------------------------
 const MODELOS = {
     az1: {
@@ -56,8 +57,11 @@ const MODELOS = {
     az160: {
         nome: 'AZX160',
         cilindrada: '160cc',
-        preco: 'R$ 19.190,00',
-        precoNum: 19190,
+        // Exceção do catálogo: o preço promocional da AZX160 NÃO inclui o emplacamento.
+        preco: 'R$ 19.990,00',
+        precoNum: 19990,
+        precoComEmplacamento: 'R$ 20.990,00',
+        precoComEmplacamentoNum: 20990,
         perfil: 'Potência, conforto e estilo — cidade e estrada.',
         descricao: 'Alta potência, confortável, econômica, já vem com proteção de carenagem e muito estilo. Entrada USB e Tipo C, farol full LED, pneus aro 19 dianteiro e 17 traseiro, painel digital, injeção eletrônica e freio CBS.',
         cores: 'Preta, Vermelha e Azul',

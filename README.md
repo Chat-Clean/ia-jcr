@@ -20,7 +20,7 @@ O ChatClean cuida só do transporte. Toda a inteligência (persona, diagnóstico
 - **Diagnóstico ANTES do produto (regra inegociável):** não revela preço, modelo nem condição antes de entender transporte atual + gasto mensal + situação de moto. Se o cliente pede preço cedo, redireciona com naturalidade.
 - **Aprofundamento emocional:** depois que o cliente diz quanto **tempo** perde por dia, a IA transforma esse tempo em ganho concreto de vida — saúde, família, estudo ou lazer — escolhendo **um** exemplo conforme o perfil, nunca os quatro.
 - **Diagnóstico financeiro (antes da simulação):** forma de pagamento → entrada (se financiamento) → parcela desejada → teto de parcela → **checagem de coerência** → restrição no nome + ciência do impacto.
-- **Preços liberados** (após o diagnóstico): AZ1, AZ125, AZX160 — sempre como preço promocional. **Nunca informa valor de parcela** (transfere pro humano) e **nunca diz que o emplacamento está incluso**.
+- **Preços liberados** (após o diagnóstico): AZ1, AZ125, AZX160 — sempre como preço promocional. **Nunca informa valor de parcela** (transfere pro humano) e **nunca diz que o emplacamento está incluso** — com uma única exceção: na **AZX160** a IA informa os dois valores (sem e com emplacamento).
 - **Fechamento:** identifica a loja (Matriz ou Geisel — obrigatório), coleta os dados de simulação (CPF, nascimento, nome, telefone, CNH, **renda**, cor/modelo) e **transfere o ticket para o departamento da loja escolhida**.
 - **Regras específicas:** não aceita moto usada na troca, não faz test drive, nunca promete prazo de entrega, CNH não é obrigatório pra comprar. Peças/revisão/garantia são encaminhados ao time da loja (a IA não diagnostica defeito nem cota serviço).
 - **Mídia:** áudio transcrito (Whisper); imagem lida por visão (gpt-4o); documento/vídeo têm acuse humanizado.
@@ -56,7 +56,7 @@ Acolher (conhece a marca?) → interesse (pra que quer a moto) → **diagnóstic
 |---|---|---|
 | AZ1 | 50cc | R$ 10.990,00 |
 | AZ125 | 125cc (Alfa) | R$ 13.290,00 |
-| AZX160 | 160cc | R$ 19.190,00 |
+| AZX160 | 160cc | R$ 19.990,00 (sem emplacamento) / R$ 20.990,00 (com emplacamento) |
 
 Formas de pagamento: cartão em até **24x**, financiamento com entrada **ZERO** em até 48x (dependendo do CPF, consulta em **4 bancos**), consórcio e à vista. A IA nunca informa valor de parcela.
 

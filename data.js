@@ -57,11 +57,10 @@ const MODELOS = {
     az160: {
         nome: 'AZX160',
         cilindrada: '160cc',
-        // Exceção do catálogo: o preço promocional da AZX160 NÃO inclui o emplacamento.
-        preco: 'R$ 19.990,00',
-        precoNum: 19990,
-        precoComEmplacamento: 'R$ 20.990,00',
-        precoComEmplacamentoNum: 20990,
+        // Exceção do catálogo: o preço promocional da AZX160 JÁ inclui o emplacamento.
+        preco: 'R$ 20.990,00',
+        precoNum: 20990,
+        emplacamentoIncluso: true,
         perfil: 'Potência, conforto e estilo — cidade e estrada.',
         descricao: 'Alta potência, confortável, econômica, já vem com proteção de carenagem e muito estilo. Entrada USB e Tipo C, farol full LED, pneus aro 19 dianteiro e 17 traseiro, painel digital, injeção eletrônica e freio CBS.',
         cores: 'Preta, Vermelha e Azul',

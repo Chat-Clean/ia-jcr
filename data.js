@@ -63,7 +63,7 @@ const MODELOS = {
         emplacamentoIncluso: true,
         perfil: 'Potência, conforto e estilo — cidade e estrada.',
         descricao: 'Alta potência, confortável, econômica, já vem com proteção de carenagem e muito estilo. Entrada USB e Tipo C, farol full LED, pneus aro 19 dianteiro e 17 traseiro, painel digital, injeção eletrônica e freio CBS.',
-        cores: 'Preta, Vermelha e Azul',
+        cores: 'Preta, Vermelha, Azul e Cinza (cor nova)',
         comparativo: 'Moto trail de 160cc que concorre com Bros 160 e Crosser 150. Motor 161,9 cm³ com injeção eletrônica, 12,3 cv, câmbio de 5 marchas, consumo médio de ~35 km/L. Design aventureiro com rodas raiadas, protetores e bolha frontal, painel digital, iluminação full LED e entradas USB. Suspensão de longo curso, freios a disco com CBS, tanque de 13 litros. Garantia de 6 meses.',
         imagem: 'https://www.instagram.com/p/DOGXo0UjWtY/?igsh=NGkxYXRkNWJuNTJy'
     }
